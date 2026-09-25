@@ -1,0 +1,63 @@
+name: Cleanup
+
+# Deletes a pull request's head branch once the PR merges, so the branch list
+# stays as clean as SwiftLib's and core's regardless of whether the merger
+# remembered the delete checkbox. Only merged same-repo heads are touched, and
+# protected branches cannot be deleted server-side, so main is never at risk.
+#
+# Tidying the branch list is janitorial, so an API this runner cannot reach
+# leaves the branch for a human to delete rather than marking a merged pull
+# request red.
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  delete-merged-branch:
+    if: github.event.pull_request.merged == true && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Delete the merged head branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+        run: |
+          set -euo pipefail
+          if [[ "$BRANCH" == "main" ]]; then
+            echo "Refusing to delete $BRANCH"
+            exit 0
+          fi
+          # Branch names carry slashes (feat/...), so the API path
+          # segment must be percent-encoded.
+          encoded="$(BRANCH="$BRANCH" python3 -c \
+            'import os, urllib.parse; print(urllib.parse.quote(os.environ["BRANCH"], safe=""))')"
+          # GITHUB_SERVER_URL is the runner-internal address, which a job container
+          # started by a pull_request event has not been able to route to; the public
+          # host is reachable from the same containers that resolve Maven Central.
+          for base in "${GITHUB_SERVER_URL%/}" "https://git.hdev.fi"; do
+            status="$(curl --silent --show-error \
+              --retry 2 --connect-timeout 10 --max-time 60 \
+              --output /tmp/delete-response.json --write-out '%{http_code}' \
+              --request DELETE \
+              --header "Authorization: token $GH_TOKEN" \
+              "$base/api/v1/repos/$GITHUB_REPOSITORY/branches/$encoded")" || status=000
+            case "$status" in
+              204) echo "Deleted merged branch $BRANCH via $base"; exit 0 ;;
+              404) echo "Branch $BRANCH is already gone"; exit 0 ;;
+              000) echo "::warning::$base is unreachable from this runner" ;;
+              *)
+                cat /tmp/delete-response.json >&2 || true
+                echo "::warning::Could not delete $BRANCH via $base (HTTP $status)"
+                ;;
+            esac
+          done
+          echo "::warning::Left $BRANCH in place; delete it from the pull request page."

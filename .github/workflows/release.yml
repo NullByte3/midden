@@ -1,0 +1,116 @@
+name: Release
+
+# A push to main whose Cargo.toml version has no release yet publishes one on
+# GitHub: tag vX.Y.Z, notes since the previous tag, Linux and Windows binaries.
+# Every version keeps its own release. Versions are bumped by hand.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Two runs racing would both try to create the same release.
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  TARGET: x86_64-unknown-linux-musl
+  WINDOWS: x86_64-pc-windows-gnu
+
+jobs:
+  publish:
+    # Forks and copies of the repository elsewhere do not publish.
+    if: github.repository == 'NullByte3/midden'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    steps:
+      - name: Check out source and release tags
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Check whether this version is released
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="$(grep -m1 '^version = "' Cargo.toml | cut -d'"' -f2)"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Cargo.toml carries an unsupported version: '$version'" >&2
+            exit 1
+          fi
+          skip=false
+          if gh release view "v$version" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            skip=true
+            echo "v$version is already released; bump the version in Cargo.toml to publish a new one."
+          fi
+          {
+            echo "version=$version"
+            echo "tag=v$version"
+            echo "skip=$skip"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install mingw-w64
+        if: steps.version.outputs.skip != 'true'
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+
+      # The runner image ships rustup, but its stable can lag behind.
+      - name: Install Rust
+        if: steps.version.outputs.skip != 'true'
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup target add "$TARGET" "$WINDOWS"
+
+      - name: Build the release binaries
+        if: steps.version.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target "$TARGET"
+          bin="target/$TARGET/release/midden"
+          if ldd "$bin" 2>&1 | grep -q '=>'; then
+            echo "expected a static binary, but it has dynamic dependencies" >&2
+            exit 1
+          fi
+          "$bin" --version
+          cargo build --release --locked --target "$WINDOWS"
+
+      - name: Publish the release
+        if: steps.version.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse HEAD)"
+
+          # Notes: the commits since the newest earlier version tag.
+          previous="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --merged "$commit" --sort=-v:refname \
+            | grep -vx "$TAG" | head -n 1 || true)"
+          range="$commit"
+          if [[ -n "$previous" ]]; then
+            range="$previous..$commit"
+          fi
+          notes="$(git log --no-merges --max-count=200 --pretty='- %s (%h)' "$range")"
+
+          linux="midden-$TARGET"
+          windows="midden-$WINDOWS.exe"
+          cp "target/$TARGET/release/midden" "$linux"
+          cp "target/$WINDOWS/release/midden.exe" "$windows"
+          sha256sum "$linux" > "$linux.sha256"
+          sha256sum "$windows" > "$windows.sha256"
+
+          # GitHub creates the tag at --target when it does not exist yet.
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$commit" --title "$TAG" \
+            --notes "$notes" "$linux" "$linux.sha256" "$windows" "$windows.sha256"
+          echo "Published $TAG at $commit"

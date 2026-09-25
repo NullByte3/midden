@@ -1,0 +1,92 @@
+name: Build
+
+on:
+  push:
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  TARGET: x86_64-unknown-linux-musl
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The default job container has no Rust, and a rust image would lack the
+      # node the runner needs for JS actions like checkout.
+      - name: Install Rust
+        run: |
+          curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/rustup" target add "$TARGET"
+
+      - name: Build
+        run: cargo build --release --locked --target "$TARGET"
+
+      # The point of the musl target: one binary that runs on any Linux,
+      # whatever glibc the host has.
+      - name: Confirm the binary is static
+        run: |
+          set -euo pipefail
+          bin="target/$TARGET/release/midden"
+          if ldd "$bin" 2>&1 | grep -q '=>'; then
+            echo "expected a static binary, but it has dynamic dependencies" >&2
+            exit 1
+          fi
+          "$bin" --version
+
+      # Best effort: Gitea's runner passes itself off as GHES, where upload-artifact
+      # v4 and up refuse to run.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        continue-on-error: true
+        with:
+          name: midden-${{ github.run_number }}
+          path: target/x86_64-unknown-linux-musl/release/midden
+          if-no-files-found: error
+
+  # Cross-compiled with mingw-w64, since the runners are Linux only.
+  windows:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TARGET: x86_64-pc-windows-gnu
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # GitHub's runners need sudo; the Gitea job container runs as root without it.
+      - name: Install mingw-w64
+        run: |
+          sudo="$(command -v sudo || true)"
+          $sudo apt-get update && $sudo apt-get install -y gcc-mingw-w64-x86-64
+
+      - name: Install Rust
+        run: |
+          curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/rustup" target add "$TARGET"
+
+      - name: Build
+        run: cargo build --release --locked --target "$TARGET"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        continue-on-error: true
+        with:
+          name: midden-windows-${{ github.run_number }}
+          path: target/x86_64-pc-windows-gnu/release/midden.exe
+          if-no-files-found: error

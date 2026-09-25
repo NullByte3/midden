@@ -1,0 +1,33 @@
+# Build output
+/target
+
+# Rust tooling
+**/*.rs.bk            # backups left by older rustfmt
+*.pdb                 # Windows debug symbols
+/Cargo.lock.orig      # merge leftovers
+
+# Profiles
+*.hprof
+*.profraw
+*.profdata
+/coverage
+lcov.info
+flamegraph.svg
+perf.data*
+
+# IDEs
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+*.swp
+*~
+
+# OS-specific 
+.DS_Store
+Thumbs.db
+
+# env
+.env
+.env.*
+!.env.example

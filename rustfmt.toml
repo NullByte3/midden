@@ -1,0 +1,4 @@
+# Compact formatting: pack anything that fits on one line up to the width
+# limit, so line count tracks logic rather than ceremony.
+max_width = 110
+use_small_heuristics = "Max"
