@@ -53,10 +53,71 @@ boxed, references, garbage, system, direct and baseline. Pick them with `--only`
   with `--no-cache`.
 - Expect about 90 bytes of RAM per object. The dump itself is streamed.
 
+## Benchmark
+
+midden 0.1.0 compared with Eclipse MAT 1.17, JProfiler 16.2.1 and the VisualVM 2.2.2 heap engine,
+run on 8 CPUs with 4 GiB of memory. Each dump was in the page cache before its runs,
+and the tables show the best of 2 or 3 runs.
+
+### Cold first run
+
+Time from start to a finished result, with no index or cache on disk. MAT is parse plus Leak
+Suspects. JProfiler is `jpanalyze -retained=true`, which builds the index its GUI opens but writes no report.
+
+| Dump | Objects | midden | midden, 1 thread | MAT | JProfiler | VisualVM |
+|---|---:|---:|---:|---:|---:|---:|
+| Paper server, 938 MB | 11.2 M | **1.95 seconds** | 3.62 seconds | 20.95 seconds | 12.05 seconds | 55.8 seconds |
+| mixed-small, 414 MB | 4.1 M | **0.68 seconds** | 1.21 seconds | 7.09 seconds | 4.11 seconds | 772 seconds |
+| mixed-1g, 1.2 GB | 11.8 M | **1.79 seconds** | 3.41 seconds | 17.15 seconds | 10.25 seconds | over 1,800 seconds, stopped |
+| arrays-1g, 1.2 GB | 37 k | **0.10 seconds** | 0.33 seconds | 1.84 seconds | 0.97 seconds | 0.37 seconds |
+| chain-8m, 429 MB | 8.0 M | **0.89 seconds** | 1.36 seconds | 12.26 seconds | 7.01 seconds | 23.8 seconds |
+| small-20m, 945 MB | 19.2 M | **6.92 seconds** | 14.95 seconds | 45.71 seconds | 33.46 seconds | 334 seconds |
+
+midden was 7 to 18 times faster than MAT and 5 to 10 times faster than JProfiler, and it was faster on a
+single thread than either of them on eight. MAT's full three-report run (suspects, overview and top
+components) took 26 to 38 seconds on Paper.
+
+### Reopening an indexed dump
+
+| Dump | midden | MAT | JProfiler |
+|---|---:|---:|---:|
+| Paper | 1.66 seconds | 30.59 seconds | **1.54 seconds** |
+| small-20m | 6.74 seconds | 18.80 seconds | **3.94 seconds** |
+
+JProfiler reopens faster on the large dumps because its analysis stores the dominator tree. midden's
+cache only stores the parse, so it saves at most 0.3 seconds.
+
+### Memory
+
+Peak RSS on Paper: midden 1.0 GB, JProfiler 1.3 GB, MAT 2.1 to 3.3 GB (at its 3 GB heap), VisualVM 3.5 GB.
+
+
+### Features
+
+| | midden | MAT | JProfiler | VisualVM |
+|---|---|---|---|---|
+| Retained sizes and dominator tree | yes | yes | yes | yes |
+| Leak suspects report | yes, objects and classes, with the accumulation point | yes | no, biggest objects view | no |
+| Path from a GC root, with field names | yes, printed for every suspect | yes | yes, in the GUI | yes, in the GUI |
+| Thread, frame and line that roots an object | yes | yes | in the GUI | in the GUI |
+| Class histogram, shallow and retained | yes, also by package | yes | yes | yes |
+| Collection fill ratios and empty collections | yes | yes | yes, inspections | through OQL |
+| Duplicate strings and arrays | yes | yes | yes, inspections | through OQL |
+| Thread locals, class loaders | yes | yes | class loaders | not checked |
+| Soft, weak and phantom references | excluded by default, `--include-soft` and `--include-weak` | followed | excluded, options to keep | followed |
+| Unreachable objects | reported separately | dropped, option to keep | dropped, option to keep | not checked |
+| Direct buffers | yes | through OQL | not checked | through OQL |
+| Compare two dumps | `--baseline` | histogram compare in the GUI | `jpcompare` and the GUI | yes, in the GUI |
+| Query objects | `--class`, `--object`, `--find`, `--where`, `--shell` | OQL | heap walker filters | OQL |
+| Reads gzip, tar and zip | yes | gzip | no | not checked |
+| Headless report | yes, text or `--json` | yes, HTML zips | no, index only, results over MCP | no |
+| Index cache | yes | yes | yes | yes |
+| Needs a JVM | no, one static binary | yes | yes | yes |
+| License | MIT | EPL 2.0 | commercial | GPL 2 with Classpath Exception |
+
 ## Development
 
 CI runs `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings`.
-
 ## License
 
 MIT, see [LICENSE](LICENSE).
