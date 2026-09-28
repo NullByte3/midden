@@ -1,8 +1,9 @@
 name: Release
 
 # A push to main whose Cargo.toml version has no release yet publishes one on
-# GitHub: tag vX.Y.Z, notes since the previous tag, Linux and Windows binaries.
-# Every version keeps its own release. Versions are bumped by hand.
+# GitHub: tag vX.Y.Z, notes since the previous tag, Linux, Windows and macOS
+# (Apple silicon) binaries. Every version keeps its own release. Versions are
+# bumped by hand.
 
 on:
   push:
@@ -21,21 +22,24 @@ defaults:
 env:
   TARGET: x86_64-unknown-linux-musl
   WINDOWS: x86_64-pc-windows-gnu
+  MACOS: aarch64-apple-darwin
 
 jobs:
-  publish:
+  version:
     # Forks and copies of the repository elsewhere do not publish.
     if: github.repository == 'NullByte3/midden'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 5
     permissions:
-      contents: write
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      skip: ${{ steps.version.outputs.skip }}
     steps:
-      - name: Check out source and release tags
+      - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
-          fetch-tags: true
           persist-credentials: false
 
       - name: Check whether this version is released
@@ -60,20 +64,73 @@ jobs:
             echo "skip=$skip"
           } >> "$GITHUB_OUTPUT"
 
+  # Linking for macOS needs Apple's SDK, so the Apple silicon binary is built on
+  # a macOS runner and handed to publish as an artifact.
+  macos:
+    needs: version
+    if: needs.version.outputs.skip != 'true'
+    runs-on: macos-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The runner image ships rustup, but its stable can lag behind.
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup target add "$MACOS"
+
+      - name: Build the macOS binary
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target "$MACOS"
+          bin="target/$MACOS/release/midden"
+          archs="$(lipo -archs "$bin")"
+          if [[ "$archs" != "arm64" ]]; then
+            echo "expected an arm64 binary, but it is built for: $archs" >&2
+            exit 1
+          fi
+          "$bin" --version
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: midden-macos
+          path: target/${{ env.MACOS }}/release/midden
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: [version, macos]
+    if: needs.version.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    steps:
+      - name: Check out source and release tags
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
       - name: Install mingw-w64
-        if: steps.version.outputs.skip != 'true'
         run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
 
       # The runner image ships rustup, but its stable can lag behind.
       - name: Install Rust
-        if: steps.version.outputs.skip != 'true'
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
           rustup target add "$TARGET" "$WINDOWS"
 
       - name: Build the release binaries
-        if: steps.version.outputs.skip != 'true'
         run: |
           set -euo pipefail
           cargo build --release --locked --target "$TARGET"
@@ -85,11 +142,16 @@ jobs:
           "$bin" --version
           cargo build --release --locked --target "$WINDOWS"
 
+      - name: Fetch the macOS binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: midden-macos
+          path: target/${{ env.MACOS }}/release
+
       - name: Publish the release
-        if: steps.version.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.version.outputs.tag }}
+          TAG: ${{ needs.version.outputs.tag }}
         run: |
           set -euo pipefail
           commit="$(git rev-parse HEAD)"
@@ -105,12 +167,16 @@ jobs:
 
           linux="midden-$TARGET"
           windows="midden-$WINDOWS.exe"
+          macos="midden-$MACOS"
           cp "target/$TARGET/release/midden" "$linux"
           cp "target/$WINDOWS/release/midden.exe" "$windows"
+          cp "target/$MACOS/release/midden" "$macos"
           sha256sum "$linux" > "$linux.sha256"
           sha256sum "$windows" > "$windows.sha256"
+          sha256sum "$macos" > "$macos.sha256"
 
           # GitHub creates the tag at --target when it does not exist yet.
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$commit" --title "$TAG" \
-            --notes "$notes" "$linux" "$linux.sha256" "$windows" "$windows.sha256"
+            --notes "$notes" "$linux" "$linux.sha256" "$windows" "$windows.sha256" \
+            "$macos" "$macos.sha256"
           echo "Published $TAG at $commit"

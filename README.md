@@ -9,11 +9,17 @@ tar or zip, and builds the full object graph and dominator tree, so every object
 ## Install
 
 Every version is on the [releases page](https://github.com/NullByte3/midden/releases) with its
-changes and binaries for Linux (static, any distro) and Windows.
+changes and binaries for Linux (static, any distro), Windows and macOS ARM64 (M-series).
 
 ```sh
 curl -fsSLO https://github.com/NullByte3/midden/releases/latest/download/midden-x86_64-unknown-linux-musl
 sudo install midden-x86_64-unknown-linux-musl /usr/local/bin/midden
+```
+
+```sh
+curl -fsSLO https://github.com/NullByte3/midden/releases/latest/download/midden-aarch64-apple-darwin
+sudo install -d /usr/local/bin
+sudo install midden-aarch64-apple-darwin /usr/local/bin/midden
 ```
 
 ```powershell

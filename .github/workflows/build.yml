@@ -90,3 +90,43 @@ jobs:
           name: midden-windows-${{ github.run_number }}
           path: target/x86_64-pc-windows-gnu/release/midden.exe
           if-no-files-found: error
+
+  # Apple silicon (M-series). Linking for macOS needs Apple's SDK, so this one
+  # builds on GitHub's macOS runner instead of cross-compiling.
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    env:
+      TARGET: aarch64-apple-darwin
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The runner image ships rustup, but its stable can lag behind.
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup target add "$TARGET"
+
+      - name: Build
+        run: cargo build --release --locked --target "$TARGET"
+
+      - name: Confirm the binary is arm64
+        run: |
+          set -euo pipefail
+          bin="target/$TARGET/release/midden"
+          archs="$(lipo -archs "$bin")"
+          if [[ "$archs" != "arm64" ]]; then
+            echo "expected an arm64 binary, but it is built for: $archs" >&2
+            exit 1
+          fi
+          "$bin" --version
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: midden-macos-${{ github.run_number }}
+          path: target/aarch64-apple-darwin/release/midden
+          if-no-files-found: error
