@@ -7,7 +7,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 use super::hash::GOLDEN_RATIO;
 use super::hprof::{Frame, Header, Piece, Root, Ty, Value};
 use super::sizes::Sizing;
-use super::store::{Bits, Column};
+use super::store::{BLOCK, Bits, Blocked, Column};
 
 pub const NONE: u32 = u32::MAX;
 
@@ -95,7 +95,7 @@ impl Kind {
     pub const ALL: [Kind; 4] = [Kind::Instance, Kind::ObjectArray, Kind::PrimitiveArray, Kind::Class];
 }
 
-/// One heap object. `len` is field bytes for instances, elements for arrays.
+/// One heap object. `len` is the elements of an array, zero for anything else.
 #[derive(Clone, Copy, Debug)]
 pub struct Object {
     pub id: u64,
@@ -110,18 +110,94 @@ pub const KIND_BITS: u32 = 2;
 /// Classes the packed word leaves room for.
 pub const MAX_CLASSES: usize = 1 << (u32::BITS - KIND_BITS);
 
-/// The object table, sorted by id, as columns: ids, and class with kind plus length. Shallow sizes are
-/// worked out on read from the class and length; a class object keeps its own in the length slot.
-/// Object ids, ascending: 8-byte steps above the first (the lowest), four bytes each, while every id fits.
+/// Object ids, ascending: 8-byte steps above the first (the lowest), blocked, while every id has one in
+/// four bytes; else whole.
 pub enum TableIds {
-    Steps(u64, Column<u32>),
+    Steps(u64, Blocked),
     Wide(Column<u64>),
 }
 
+impl TableIds {
+    pub fn steps(base: u64, steps: &[u32]) -> TableIds {
+        TableIds::Steps(base, Blocked::new(steps.len(), |object| u64::from(steps[object])))
+    }
+}
+
+/// How a shape word splits: the kind in the low bits, `class_bits` of class, then the length.
+#[derive(Clone, Copy)]
+pub struct Packing {
+    class_bits: u32,
+}
+
+impl Packing {
+    /// Room for classes `0..classes`.
+    pub fn new(classes: usize) -> Packing {
+        Packing { class_bits: usize::BITS - classes.saturating_sub(1).leading_zeros() }
+    }
+
+    fn len_shift(self) -> u32 {
+        KIND_BITS + self.class_bits
+    }
+
+    /// All ones in the length bits: the length is in the long list.
+    fn marker(self) -> u32 {
+        u32::MAX.checked_shr(self.len_shift()).unwrap_or(0)
+    }
+
+    /// One object's word, and its length again when that goes in the long list.
+    pub fn pack(self, class: u32, kind: Kind, len: u32) -> (u32, Option<u32>) {
+        let marker = self.marker();
+        let inline = len.min(marker).checked_shl(self.len_shift()).unwrap_or(0);
+        (inline | class << KIND_BITS | kind as u32, (len >= marker && len != 0).then_some(len))
+    }
+}
+
+/// Class, kind and length of each object in one word. The length is an array's elements or a class
+/// object's shallow size; an instance's size comes from its class. A length too long for its bits is
+/// kept in `long`, by object.
+pub struct Shapes {
+    words: Column<u32>,
+    packing: Packing,
+    long: Vec<(u32, u32)>,
+}
+
+impl Shapes {
+    pub fn new(words: Column<u32>, packing: Packing, long: Vec<(u32, u32)>) -> Shapes {
+        Shapes { words, packing, long }
+    }
+
+    pub fn words(&self) -> &[u32] {
+        &self.words
+    }
+
+    pub fn long(&self) -> &[(u32, u32)] {
+        &self.long
+    }
+
+    fn class(&self, word: u32) -> u32 {
+        ((u64::from(word) >> KIND_BITS) & ((1 << self.packing.class_bits) - 1)) as u32
+    }
+
+    fn kind(word: u32) -> Kind {
+        Kind::ALL[(word & ((1 << KIND_BITS) - 1)) as usize]
+    }
+
+    fn len(&self, object: usize, word: u32) -> u32 {
+        let inline = (u64::from(word) >> self.packing.len_shift()) as u32;
+        if inline != self.packing.marker() {
+            return inline;
+        }
+        let found = self.long.binary_search_by_key(&(object as u32), |&(object, _)| object);
+        found.map_or(0, |at| self.long[at].1)
+    }
+}
+
+/// The object table, sorted by id, as columns: ids, and the shape words. Shallow sizes are worked out on
+/// read from the class and length.
 pub struct ObjectTable {
     ids: TableIds,
     lookup: Buckets,
-    shapes: Column<[u32; 2]>,
+    shapes: Shapes,
     /// Per class: an instance's shallow size, and an array element's footprint.
     instance_shallow: Vec<u32>,
     element_size: Vec<u32>,
@@ -130,11 +206,11 @@ pub struct ObjectTable {
 
 impl ObjectTable {
     /// An empty table for these classes and sizes.
-    fn new(classes: &[Class], sizing: Sizing, capacity: usize) -> ObjectTable {
+    fn new(classes: &[Class], sizing: Sizing) -> ObjectTable {
         ObjectTable {
-            ids: TableIds::Steps(0, Column::with_capacity(capacity)),
+            ids: TableIds::Wide(Column::with_capacity(0)),
             lookup: Buckets::empty(),
-            shapes: Column::with_capacity(capacity),
+            shapes: Shapes::new(Column::with_capacity(0), Packing::new(classes.len()), Vec::new()),
             instance_shallow: classes.iter().map(|class| class.shallow).collect(),
             element_size: classes
                 .iter()
@@ -145,61 +221,30 @@ impl ObjectTable {
     }
 
     /// A table from merged columns.
-    pub fn from_steps(
-        classes: &[Class],
-        sizing: Sizing,
-        ids: TableIds,
-        shapes: Column<[u32; 2]>,
-    ) -> ObjectTable {
-        let mut table = ObjectTable::new(classes, sizing, 0);
+    pub fn from_steps(classes: &[Class], sizing: Sizing, ids: TableIds, shapes: Shapes) -> ObjectTable {
+        let mut table = ObjectTable::new(classes, sizing);
         (table.ids, table.shapes) = (ids, shapes);
         table.index();
         table
     }
 
     /// A table from cached columns.
-    pub fn from_columns(
-        classes: &[Class],
-        sizing: Sizing,
-        ids: &[u64],
-        shapes: Column<[u32; 2]>,
-    ) -> ObjectTable {
-        let mut table = ObjectTable::new(classes, sizing, ids.len());
-        for &id in ids {
-            table.push_id(id);
-        }
+    pub fn from_columns(classes: &[Class], sizing: Sizing, ids: &[u64], shapes: Shapes) -> ObjectTable {
+        let mut table = ObjectTable::new(classes, sizing);
+        let base = ids.first().copied().unwrap_or(0);
+        let steps: Option<Column<u32>> = ids.iter().map(|&id| step_of(base, id)).collect();
+        table.ids = match steps {
+            Some(steps) => TableIds::steps(base, &steps),
+            None => TableIds::Wide(ids.iter().copied().collect()),
+        };
         table.shapes = shapes;
         table.index();
         table
     }
 
-    /// The packed class, kind and length per object, as the cache stores them.
-    pub fn shapes(&self) -> &[[u32; 2]] {
+    /// The shape words, as the cache stores them.
+    pub fn shapes(&self) -> &Shapes {
         &self.shapes
-    }
-
-    fn push_id(&mut self, id: u64) {
-        let wide = match &mut self.ids {
-            TableIds::Wide(wide) => {
-                wide.push(id);
-                return;
-            }
-            TableIds::Steps(base, steps) => {
-                if steps.is_empty() {
-                    *base = id;
-                }
-                if let Some(step) = step_of(*base, id) {
-                    steps.push(step);
-                    return;
-                }
-                // An id past four bytes of steps: keep them all whole from here on.
-                let mut wide = Column::with_capacity(steps.len() + 1);
-                wide.extend(steps.iter().map(|&step| *base + (u64::from(step) << 3)));
-                wide.push(id);
-                wide
-            }
-        };
-        self.ids = TableIds::Wide(wide);
     }
 
     /// Bucket the ids for lookups, once they are all in.
@@ -208,16 +253,16 @@ impl ObjectTable {
     }
 
     pub fn len(&self) -> usize {
-        self.shapes.len()
+        self.shapes.words.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.shapes.is_empty()
+        self.shapes.words.is_empty()
     }
 
     pub fn id(&self, object: usize) -> u64 {
         match &self.ids {
-            TableIds::Steps(base, steps) => base + (u64::from(steps[object]) << 3),
+            TableIds::Steps(base, steps) => base + (steps.get(object) << 3),
             TableIds::Wide(wide) => wide[object],
         }
     }
@@ -225,45 +270,72 @@ impl ObjectTable {
     /// The index of the object with this id.
     pub fn lookup(&self, id: u64) -> Option<u32> {
         let (lo, hi) = self.lookup.range(id)?;
-        let found = match &self.ids {
-            TableIds::Steps(base, steps) => steps[lo..hi].binary_search(&step_of(*base, id)?),
-            TableIds::Wide(wide) => wide[lo..hi].binary_search(&id),
+        let at = match &self.ids {
+            TableIds::Steps(base, steps) => {
+                let step = u64::from(step_of(*base, id)?);
+                // Within one block the two-byte parts ascend too, the long ones last.
+                if hi > lo && (hi - 1) / BLOCK == lo / BLOCK {
+                    let wanted =
+                        step.checked_sub(steps.base(lo)).and_then(|wanted| u16::try_from(wanted).ok());
+                    if let Some(wanted) = wanted.filter(|&wanted| wanted != u16::MAX) {
+                        return steps.above(lo, hi).binary_search(&wanted).ok().map(|at| (lo + at) as u32);
+                    }
+                }
+                let (mut at, mut end) = (lo, hi);
+                while at < end {
+                    let mid = at + (end - at) / 2;
+                    if steps.get(mid) < step {
+                        at = mid + 1;
+                    } else {
+                        end = mid;
+                    }
+                }
+                (at < hi && steps.get(at) == step).then_some(at)
+            }
+            TableIds::Wide(wide) => wide[lo..hi].binary_search(&id).ok().map(|i| lo + i),
         };
-        found.ok().map(|i| (lo + i) as u32)
+        at.map(|at| at as u32)
     }
 
     pub fn class(&self, object: usize) -> u32 {
-        self.shapes[object][0] >> KIND_BITS
+        self.shapes.class(self.shapes.words[object])
     }
 
     pub fn kind(&self, object: usize) -> Kind {
-        Kind::ALL[(self.shapes[object][0] & ((1 << KIND_BITS) - 1)) as usize]
+        Shapes::kind(self.shapes.words[object])
     }
 
     pub fn shallow(&self, object: usize) -> u32 {
-        self.shape_shallow(self.shapes[object])
+        self.shallow_of(object, self.shapes.words[object])
     }
 
-    fn shape_shallow(&self, [class_kind, len]: [u32; 2]) -> u32 {
-        let class = (class_kind >> KIND_BITS) as usize;
-        match Kind::ALL[(class_kind & ((1 << KIND_BITS) - 1)) as usize] {
+    fn shallow_of(&self, object: usize, word: u32) -> u32 {
+        let class = self.shapes.class(word) as usize;
+        match Shapes::kind(word) {
             Kind::Instance => self.instance_shallow[class],
-            Kind::ObjectArray => self.sizing.array_size(u64::from(len), self.sizing.ref_size),
-            Kind::PrimitiveArray => self.sizing.array_size(u64::from(len), self.element_size[class]),
-            Kind::Class => len,
+            Kind::ObjectArray => {
+                self.sizing.array_size(u64::from(self.shapes.len(object, word)), self.sizing.ref_size)
+            }
+            Kind::PrimitiveArray => {
+                self.sizing.array_size(u64::from(self.shapes.len(object, word)), self.element_size[class])
+            }
+            Kind::Class => self.shapes.len(object, word),
         }
     }
 
     /// Everything about one object.
     pub fn get(&self, object: usize) -> Object {
-        let shape = self.shapes[object];
-        let kind = Kind::ALL[(shape[0] & ((1 << KIND_BITS) - 1)) as usize];
-        let len = if kind == Kind::Class { 0 } else { shape[1] };
+        let word = self.shapes.words[object];
+        let kind = Shapes::kind(word);
+        let len = match kind {
+            Kind::ObjectArray | Kind::PrimitiveArray => self.shapes.len(object, word),
+            Kind::Instance | Kind::Class => 0,
+        };
         Object {
             id: self.id(object),
-            class: shape[0] >> KIND_BITS,
+            class: self.shapes.class(word),
             len,
-            shallow: self.shape_shallow(shape),
+            shallow: self.shallow_of(object, word),
             kind,
         }
     }
@@ -275,7 +347,7 @@ impl ObjectTable {
 
     /// Shallow sizes of objects `start..end`, in order.
     pub fn shallow_range(&self, start: usize, end: usize) -> impl Iterator<Item = u32> + '_ {
-        self.shapes[start..end].iter().map(|&shape| self.shape_shallow(shape))
+        (start..).zip(&self.shapes.words[start..end]).map(|(object, &word)| self.shallow_of(object, word))
     }
 }
 

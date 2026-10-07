@@ -7,7 +7,8 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use super::dump::{
-    ArrayHashes, Class, Dump, FastMap, Field, ObjectTable, RefKind, Slot, Static, Symbols, Thread, Trace,
+    ArrayHashes, Class, Dump, FastMap, Field, ObjectTable, Packing, RefKind, Shapes, Slot, Static, Symbols,
+    Thread, Trace,
 };
 use super::graph::{Graph, ReferencePolicy};
 use super::hash::{FNV_OFFSET_BASIS, FNV_PRIME};
@@ -16,7 +17,7 @@ use super::sizes::{SizeMode, Sizing};
 use super::store::Column;
 
 const MAGIC: &[u8; 8] = b"CTDLHEAP";
-const VERSION: u32 = 8;
+const VERSION: u32 = 9;
 /// Spreads each key field before the next is folded in. Part of the file name: never change.
 const KEY_ROTATION: u32 = 17;
 /// Written for a class that is no Reference; reads back as None.
@@ -250,10 +251,8 @@ pub fn save(path: &Path, key: &Key, dump: &Dump, graph: &Graph) -> io::Result<()
     }
     let (objects, shapes) = (&dump.objects, dump.objects.shapes());
     writer.u64s(objects.len(), (0..objects.len()).map(|object| objects.id(object)))?;
-    writer.u64s(
-        shapes.len(),
-        shapes.iter().map(|&[low, high]| u64::from(low) | u64::from(high) << u32::BITS),
-    )?;
+    writer.u32s(shapes.words().len(), shapes.words().iter().copied())?;
+    writer.u32s(2 * shapes.long().len(), shapes.long().iter().flat_map(|&(object, len)| [object, len]))?;
     writer.count(dump.roots.len())?;
     for (idx, root) in &dump.roots {
         writer.u32(*idx)?;
@@ -292,11 +291,11 @@ pub fn save(path: &Path, key: &Key, dump: &Dump, graph: &Graph) -> io::Result<()
     for value in [dump.class_class, dump.string_class, dump.value_label, dump.name_label] {
         writer.u32(value)?;
     }
-    let (targets, labels, weak) = graph.parts();
+    let (targets, weak) = graph.parts();
     let offsets = graph.offsets();
     writer.u64s(offsets.len(), offsets)?;
     writer.u32s(targets.len(), targets.iter().copied())?;
-    writer.u32s(labels.len(), labels.iter().copied())?;
+    writer.u32s(targets.len(), graph.all_labels())?;
     writer.u32s(2 * weak.len(), weak.iter().flat_map(|&(referrer, referent)| [referrer, referent]))?;
     writer.u64(graph.dangling)?;
     writer.u32s(graph.roots.len(), graph.roots.iter().copied())?;
@@ -393,14 +392,14 @@ fn read(mut reader: Reader, key: &Key, dump_path: &str) -> io::Result<(Dump, Gra
         classes.push(class);
     }
     let ids = reader.u64s()?;
-    let shapes = reader.column(|bytes: [u8; 8]| {
-        let packed = u64::from_le_bytes(bytes);
-        [packed as u32, (packed >> u32::BITS) as u32]
-    })?;
+    let words = reader.u32s()?;
+    let long: Vec<(u32, u32)> =
+        reader.u32s()?.as_chunks::<2>().0.iter().map(|pair| (pair[0], pair[1])).collect();
     let count = ids.len();
-    if shapes.len() != count {
+    if words.len() != count || !long.is_sorted_by_key(|&(object, _)| object) {
         return Err(invalid());
     }
+    let shapes = Shapes::new(words, Packing::new(classes.len()), long);
     let mut roots = Vec::new();
     for _ in 0..reader.u32()? {
         let (idx, id) = (reader.u32()?, reader.u64()?);
@@ -494,5 +493,6 @@ fn read(mut reader: Reader, key: &Key, dump_path: &str) -> io::Result<(Dump, Gra
         value_label,
         name_label,
     };
-    Ok((dump, Graph::from_parts(offsets, targets, labels, weak, dangling, graph_roots)))
+    let names = dump.names.len();
+    Ok((dump, Graph::from_parts(offsets, targets, labels, names, weak, dangling, graph_roots)))
 }

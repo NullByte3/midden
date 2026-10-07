@@ -127,3 +127,69 @@ impl<T> Extend<T> for Column<T> {
         self.0.extend(values);
     }
 }
+
+/// Values per base in a [`Blocked`] column.
+pub const BLOCK: usize = 64;
+
+/// Ascending values in two bytes each above a base every [`BLOCK`] of them. One too far above its base
+/// is all ones there and kept whole in `long`, by index.
+pub struct Blocked {
+    bases: Column<u64>,
+    above: Column<u16>,
+    long: Vec<(u32, u64)>,
+}
+
+impl Blocked {
+    /// `value(i)` for every `i` in `0..len`, ascending, laid out by the workers.
+    pub fn new(len: usize, value: impl Fn(usize) -> u64 + Sync) -> Blocked {
+        let mut bases = Column::<u64>::zeroed(len.div_ceil(BLOCK));
+        let mut above = Column::<u16>::zeroed(len);
+        let per = bases.len().div_ceil(super::parallel::threads()).max(1);
+        let value = &value;
+        let tasks: Vec<_> = bases
+            .chunks_mut(per)
+            .zip(above.chunks_mut(per * BLOCK))
+            .enumerate()
+            .map(|(task, (bases, above))| {
+                move || {
+                    let mut long = Vec::new();
+                    for (block, (base, above)) in bases.iter_mut().zip(above.chunks_mut(BLOCK)).enumerate() {
+                        let start = (task * per + block) * BLOCK;
+                        *base = value(start);
+                        for (i, above) in (start..).zip(above.iter_mut()) {
+                            let value = value(i);
+                            *above = u16::try_from(value - *base).unwrap_or(u16::MAX);
+                            if *above == u16::MAX {
+                                long.push((i as u32, value));
+                            }
+                        }
+                    }
+                    long
+                }
+            })
+            .collect();
+        let long = super::parallel::run_all(tasks).concat();
+        Blocked { bases, above, long }
+    }
+
+    pub fn get(&self, i: usize) -> u64 {
+        match self.above[i] {
+            u16::MAX => self.long[self.long.partition_point(|&(at, _)| (at as usize) < i)].1,
+            above => self.bases[i / BLOCK] + u64::from(above),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.above.len()
+    }
+
+    /// The base of the block holding `i`.
+    pub fn base(&self, i: usize) -> u64 {
+        self.bases[i / BLOCK]
+    }
+
+    /// The two-byte parts of `lo..hi`: within one block they ascend, the long ones last.
+    pub fn above(&self, lo: usize, hi: usize) -> &[u16] {
+        &self.above[lo..hi]
+    }
+}

@@ -9,8 +9,8 @@ use std::sync::Arc;
 use super::analysis::duplicates::boxed_classes;
 use super::detail::ArrayHash;
 use super::dump::{
-    self, ArrayHashes, Class, Dump, FastMap, Field, KIND_BITS, Kind, MAX_CLASS_DEPTH, MAX_CLASSES, NONE,
-    ObjectTable, RefKind, Slot, Static, Symbols, TableIds,
+    self, ArrayHashes, Class, Dump, FastMap, Field, Kind, MAX_CLASS_DEPTH, MAX_CLASSES, NONE, ObjectTable,
+    Packing, RefKind, Shapes, Slot, Static, Symbols, TableIds,
 };
 use super::graph::LOADER;
 use super::hprof::{
@@ -765,7 +765,7 @@ fn merge_stretches(runs: &[&[Raw]]) -> Vec<(usize, usize, usize)> {
 /// The object table's columns, merged from the walk's runs.
 struct Merged {
     ids: TableIds,
-    shapes: Column<[u32; 2]>,
+    shapes: Shapes,
     starts: Column<u32>,
     hashes: Column<[u64; 2]>,
     instances: Vec<u64>,
@@ -802,12 +802,10 @@ fn merge_table(runs: &[&[Raw]], hashes: &[[u64; 2]], class_count: usize, keep: b
     let total: usize = counts.iter().map(|count| count.0).sum();
     let total_arrays: usize = counts.iter().map(|count| count.1).sum();
     let narrow = counts.iter().all(|count| count.2);
-    let mut ids = if narrow {
-        TableIds::Steps(base, Column::zeroed(total))
-    } else {
-        TableIds::Wide(Column::zeroed(total))
-    };
-    let mut shapes = Column::<[u32; 2]>::zeroed(total);
+    let mut steps = Column::<u32>::zeroed(if narrow { total } else { 0 });
+    let mut wide = Column::<u64>::zeroed(if narrow { 0 } else { total });
+    let packing = Packing::new(class_count);
+    let mut words = Column::<u32>::zeroed(total);
     let mut starts = Column::<u32>::zeroed(if keep { total } else { 0 });
     let mut array_values = Column::<[u64; 2]>::zeroed(total_arrays);
     // Stretches in groups of about equal size, one per worker, each writing its own slice of every column.
@@ -823,11 +821,9 @@ fn merge_table(runs: &[&[Raw]], hashes: &[[u64; 2]], class_count: usize, keep: b
     }
     bounds.push(stretches.len());
     let mut tasks = Vec::new();
-    let (mut id_rest, mut wide_rest): (&mut [u32], &mut [u64]) = match &mut ids {
-        TableIds::Steps(_, steps) => (&mut steps[..], &mut []),
-        TableIds::Wide(wide) => (&mut [], &mut wide[..]),
-    };
-    let (mut shape_rest, mut start_rest) = (&mut shapes[..], &mut starts[..]);
+    let (mut id_rest, mut wide_rest) = (&mut steps[..], &mut wide[..]);
+    let (mut shape_rest, mut start_rest) = (&mut words[..], &mut starts[..]);
+    let mut first_object = 0;
     let mut value_rest = &mut array_values[..];
     for pair in bounds.windows(2) {
         let (lo, hi) = (pair[0], pair[1]);
@@ -845,7 +841,7 @@ fn merge_table(runs: &[&[Raw]], hashes: &[[u64; 2]], class_count: usize, keep: b
         value_rest = rest;
         let (stretches, records) = (&stretches, &records);
         tasks.push(move || {
-            let mut instances = vec![0u64; class_count];
+            let (mut instances, mut long) = (vec![0u64; class_count], Vec::new());
             let (mut at, mut array_at, mut previous) = (0, 0, last_id(lo));
             for stretch in &stretches[lo..hi] {
                 for &record in records(stretch) {
@@ -864,22 +860,29 @@ fn merge_table(runs: &[&[Raw]], hashes: &[[u64; 2]], class_count: usize, keep: b
                     } else {
                         wide_part[at] = record[0];
                     }
-                    shape_part[at] = [class << KIND_BITS | kind as u32, record[1] as u32];
+                    // An instance's size comes from its class.
+                    let len = if kind == Kind::Instance { 0 } else { record[1] as u32 };
+                    let (word, too_long) = packing.pack(class, kind, len);
+                    shape_part[at] = word;
+                    long.extend(too_long.map(|len| ((first_object + at) as u32, len)));
                     if keep {
                         start_part[at] = record[2] as u32;
                     }
                     at += 1;
                 }
             }
-            instances
+            (instances, long)
         });
+        first_object += objects;
     }
     let parts = parallel::run_all(tasks);
-    let mut instances = vec![0u64; class_count];
-    for part in parts {
+    let (mut instances, mut long) = (vec![0u64; class_count], Vec::new());
+    for (part, part_long) in parts {
         instances.iter_mut().zip(part).for_each(|(total, count)| *total += count);
+        long.extend(part_long);
     }
-    Merged { ids, shapes, starts, hashes: array_values, instances }
+    let ids = if narrow { TableIds::steps(base, &steps) } else { TableIds::Wide(wide) };
+    Merged { ids, shapes: Shapes::new(words, packing, long), starts, hashes: array_values, instances }
 }
 
 /// Resolve the roots against the object table and list each thread once.

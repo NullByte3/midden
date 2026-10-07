@@ -9,7 +9,7 @@ use super::hprof::{self, Body, IO_BUFFER_SIZE, Sink, Ty, be_uint};
 use super::index::References;
 use super::parallel;
 use super::source::Source;
-use super::store::Column;
+use super::store::{Blocked, Column};
 use crate::error::{Error, Result};
 
 /// Label flag: the edge is an array element, the low bits are its index.
@@ -33,48 +33,165 @@ impl ReferencePolicy {
     }
 }
 
-/// Targets, labels and weak edges, as the cache stores them.
-pub type Parts<'a> = (&'a [u32], &'a [u32], &'a [(u32, u32)]);
+/// Targets and weak edges, as the cache stores them.
+pub type Parts<'a> = (&'a [u32], &'a [(u32, u32)]);
 
-/// Objects per base in [`Offsets`].
-const OFFSET_BLOCK_BITS: u32 = 12;
-
-/// Where each object's edges start: four bytes each above a base every 4096 objects, or eight when a block
-/// holds 4G edges or more.
-struct Offsets {
-    low: Column<u32>,
-    bases: Vec<u64>,
-    wide: Option<Column<u64>>,
-}
+/// Where each object's edges start, then the total: two bytes each above a base every block of objects.
+struct Offsets(Blocked);
 
 impl Offsets {
+    // Takes the plain offsets so they are freed once packed.
+    #[allow(clippy::needless_pass_by_value)]
     fn new(offsets: Column<u64>) -> Offsets {
-        let bases: Vec<u64> = offsets.iter().step_by(1 << OFFSET_BLOCK_BITS).copied().collect();
-        let fits = offsets
-            .iter()
-            .enumerate()
-            .all(|(i, &offset)| u32::try_from(offset - bases[i >> OFFSET_BLOCK_BITS]).is_ok());
-        if !fits {
-            return Offsets { low: Column::with_capacity(0), bases, wide: Some(offsets) };
-        }
-        let mut low = Column::<u32>::zeroed(offsets.len());
-        parallel::chunks(&mut low, |start, part| {
-            for (i, value) in (start..).zip(part.iter_mut()) {
-                *value = (offsets[i] - bases[i >> OFFSET_BLOCK_BITS]) as u32;
-            }
-        });
-        Offsets { low, bases, wide: None }
+        Offsets(Blocked::new(offsets.len(), |i| offsets[i]))
     }
 
     fn get(&self, i: usize) -> u64 {
-        match &self.wide {
-            Some(wide) => wide[i],
-            None => self.bases[i >> OFFSET_BLOCK_BITS] + u64::from(self.low[i]),
-        }
+        self.0.get(i)
     }
 
     fn len(&self) -> usize {
-        self.wide.as_ref().map_or(self.low.len(), |wide| wide.len())
+        self.0.len()
+    }
+}
+
+/// A label code with this bit is an array element; the rest is the nulls since the previous element.
+const ELEMENT: u16 = 1 << 15;
+/// The low bits of a code whose label is kept whole in the escapes.
+const ESCAPED: u16 = ELEMENT - 1;
+
+/// Edge labels in two bytes each: a code for the field (the most used fields get one), or for an array
+/// element the nulls since the previous one. A field without a code and a gap past fifteen bits leave
+/// the low bits all ones, and the label is kept whole in `escapes`, by edge.
+struct Labels {
+    codes: Column<u16>,
+    fields: Vec<u32>,
+    escapes: Vec<(u64, u32)>,
+}
+
+impl Labels {
+    /// Code the labels of the edges `offsets` lays out. Field labels are below `names`, or `LOADER`.
+    // Takes the plain labels so they are freed once coded.
+    #[allow(clippy::needless_pass_by_value)]
+    fn new(offsets: &Offsets, labels: Column<u32>, names: usize) -> Labels {
+        let slot = |label: u32| match label {
+            LOADER => names,
+            label if (label as usize) < names => label as usize,
+            _ => names + 1,
+        };
+        let counts = parallel::ranges(labels.len(), |lo, hi| {
+            let mut counts = vec![0u64; names + 2];
+            for &label in labels[lo..hi].iter().filter(|&&label| label & ARRAY_ELEMENT == 0) {
+                counts[slot(label)] += 1;
+            }
+            counts
+        });
+        let mut used: Vec<(u64, u32)> = (0..=names)
+            .map(|at| {
+                (
+                    counts.iter().map(|part| part[at]).sum::<u64>(),
+                    if at == names { LOADER } else { at as u32 },
+                )
+            })
+            .filter(|&(count, _)| count > 0)
+            .collect();
+        used.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        used.truncate(usize::from(ESCAPED));
+        let fields: Vec<u32> = used.iter().map(|&(_, label)| label).collect();
+        let mut code_of = vec![ESCAPED; names + 2];
+        for (code, &label) in fields.iter().enumerate() {
+            code_of[slot(label)] = code as u16;
+        }
+        // Workers take ranges of objects, each coding its own run of edges.
+        let objects = offsets.len() - 1;
+        let per = objects.div_ceil(parallel::threads()).max(1);
+        let mut codes = Column::<u16>::zeroed(labels.len());
+        let mut rest = &mut codes[..];
+        let mut tasks = Vec::new();
+        for lo in (0..objects).step_by(per) {
+            let hi = (lo + per).min(objects);
+            let (start, end) = (offsets.get(lo), offsets.get(hi));
+            let (part, tail) = std::mem::take(&mut rest).split_at_mut((end - start) as usize);
+            rest = tail;
+            let (labels, code_of) = (&labels, &code_of);
+            tasks.push(move || {
+                let mut escapes = Vec::new();
+                for object in lo..hi {
+                    let mut previous: Option<u32> = None;
+                    for edge in offsets.get(object)..offsets.get(object + 1) {
+                        let label = labels[edge as usize];
+                        let code = if label & ARRAY_ELEMENT == 0 {
+                            code_of[slot(label)]
+                        } else {
+                            let index = label & !ARRAY_ELEMENT;
+                            let gap = index - previous.map_or(0, |previous| previous + 1);
+                            previous = Some(index);
+                            ELEMENT | u16::try_from(gap).unwrap_or(ESCAPED).min(ESCAPED)
+                        };
+                        if code & ESCAPED == ESCAPED {
+                            escapes.push((edge, label));
+                        }
+                        part[(edge - start) as usize] = code;
+                    }
+                }
+                escapes
+            });
+        }
+        let escapes = parallel::run_all(tasks).concat();
+        Labels { codes, fields, escapes }
+    }
+}
+
+/// One object's labels, decoded in order.
+#[derive(Clone, Copy)]
+struct EdgeLabels<'a> {
+    codes: &'a [u16],
+    /// The first edge's place among all edges.
+    start: u64,
+    fields: &'a [u32],
+    escapes: &'a [(u64, u32)],
+}
+
+impl<'a> EdgeLabels<'a> {
+    /// Edge `k`'s field label, or just `ARRAY_ELEMENT` for an element.
+    fn coarse(self, k: usize) -> u32 {
+        let code = self.codes[k];
+        if code & ELEMENT != 0 {
+            ARRAY_ELEMENT
+        } else if code == ESCAPED {
+            self.escape(self.start + k as u64)
+        } else {
+            self.fields[usize::from(code)]
+        }
+    }
+
+    /// Edge `k`'s label; an element's index adds up the gaps before it.
+    fn exact(self, k: usize) -> u32 {
+        match self.codes[k] & ELEMENT {
+            0 => self.coarse(k),
+            _ => self.iter().nth(k).expect("k is an edge"),
+        }
+    }
+
+    fn escape(self, edge: u64) -> u32 {
+        self.escapes[self.escapes.partition_point(|&(at, _)| at < edge)].1
+    }
+
+    fn iter(self) -> impl Iterator<Item = u32> + 'a {
+        let mut previous: Option<u32> = None;
+        (self.start..).zip(self.codes).map(move |(edge, &code)| {
+            let label = if code & ESCAPED == ESCAPED {
+                self.escape(edge)
+            } else if code & ELEMENT != 0 {
+                ARRAY_ELEMENT | (previous.map_or(0, |previous| previous + 1) + u32::from(code & ESCAPED))
+            } else {
+                self.fields[usize::from(code)]
+            };
+            if label & ARRAY_ELEMENT != 0 {
+                previous = Some(label & !ARRAY_ELEMENT);
+            }
+            label
+        })
     }
 }
 
@@ -84,7 +201,7 @@ pub struct Graph {
     pub root: u32,
     offsets: Offsets,
     targets: Column<u32>,
-    labels: Column<u32>,
+    labels: Labels,
     /// Referent edges left out of the graph proper, sorted by source.
     weak: Vec<(u32, u32)>,
     /// References to ids the dump does not contain.
@@ -97,7 +214,7 @@ pub struct Graph {
 #[derive(Clone, Copy)]
 pub struct Edges<'a> {
     targets: &'a [u32],
-    labels: &'a [u32],
+    labels: EdgeLabels<'a>,
 }
 
 impl<'a> Edges<'a> {
@@ -105,21 +222,28 @@ impl<'a> Edges<'a> {
         self.targets.len()
     }
 
-    pub fn targets(&self) -> impl Iterator<Item = u32> + 'a {
+    pub fn targets(&self) -> impl Iterator<Item = u32> + use<'a> {
         self.targets.iter().copied()
     }
 
-    pub fn labels(&self) -> impl Iterator<Item = u32> + 'a {
-        self.labels.iter().copied()
+    pub fn labels(&self) -> impl Iterator<Item = u32> + use<'a> {
+        self.labels.iter()
     }
 
     /// `(target, label)` pairs.
-    pub fn iter(&self) -> impl Iterator<Item = (u32, u32)> + 'a {
+    pub fn iter(&self) -> impl Iterator<Item = (u32, u32)> + use<'a> {
         self.targets().zip(self.labels())
     }
 
+    /// `(target, label)` pairs with every element's label just `ARRAY_ELEMENT`: no gaps to add up.
+    pub fn iter_coarse(&self) -> impl Iterator<Item = (u32, u32)> + use<'a> {
+        let labels = self.labels;
+        self.targets().enumerate().map(move |(k, target)| (target, labels.coarse(k)))
+    }
+
     pub fn label_of(&self, target: u32) -> Option<u32> {
-        self.iter().find(|&(to, _)| to == target).map(|(_, label)| label)
+        let k = self.targets.iter().position(|&to| to == target)?;
+        Some(self.labels.exact(k))
     }
 }
 
@@ -137,7 +261,12 @@ impl Graph {
     pub fn edges(&self, object: u32) -> Edges<'_> {
         let (lo, hi) =
             (self.offsets.get(object as usize) as usize, self.offsets.get(object as usize + 1) as usize);
-        Edges { targets: &self.targets[lo..hi], labels: &self.labels[lo..hi] }
+        let labels = &self.labels;
+        let (codes, start) = (&labels.codes[lo..hi], lo as u64);
+        Edges {
+            targets: &self.targets[lo..hi],
+            labels: EdgeLabels { codes, start, fields: &labels.fields, escapes: &labels.escapes },
+        }
     }
 
     pub fn edge_count(&self) -> u64 {
@@ -159,7 +288,10 @@ impl Graph {
 
     /// The target of `object`'s edge labelled `label`.
     pub fn field(&self, object: u32, label: u32) -> Option<u32> {
-        self.edges(object).iter().find(|&(_, edge_label)| edge_label == label).map(|(target, _)| target)
+        self.edges(object)
+            .iter_coarse()
+            .find(|&(_, edge_label)| edge_label == label)
+            .map(|(target, _)| target)
     }
 
     /// The referent of a Reference object, weak or strong.
@@ -167,20 +299,22 @@ impl Graph {
         self.field(object, referent_label).or_else(|| self.weak_referents(object).next())
     }
 
-    /// Reassemble a graph from cached parts.
+    /// Reassemble a graph from cached parts; field labels are below `names`, or `LOADER`.
     pub fn from_parts(
         offsets: Column<u64>,
         targets: Column<u32>,
         labels: Column<u32>,
+        names: usize,
         weak: Vec<(u32, u32)>,
         dangling: u64,
         roots: Vec<u32>,
     ) -> Graph {
+        let offsets = Offsets::new(offsets);
         Graph {
             root: offsets.len() as u32 - 1,
-            offsets: Offsets::new(offsets),
+            labels: Labels::new(&offsets, labels, names),
+            offsets,
             targets,
-            labels,
             weak,
             dangling,
             roots,
@@ -189,7 +323,12 @@ impl Graph {
 
     /// The parts the cache writes.
     pub fn parts(&self) -> Parts<'_> {
-        (&self.targets, &self.labels, &self.weak)
+        (&self.targets, &self.weak)
+    }
+
+    /// Every edge's label, object by object.
+    pub fn all_labels(&self) -> impl Iterator<Item = u32> + '_ {
+        (0..self.root).flat_map(|object| self.edges(object).labels())
     }
 
     /// Where each object's edges start, then the total, as the cache stores them.
@@ -308,6 +447,7 @@ pub fn build(
         let (mut targets, labels) = (target_column, label_column);
         parallel::chunks(&mut targets, |_, part| part.iter_mut().for_each(|target| *target -= 1));
         let offsets = Offsets::new(offsets);
+        let labels = Labels::new(&offsets, labels, dump.names.len());
         return Ok(Graph { root: object_count as u32, offsets, targets, labels, weak, dangling, roots });
     }
 
@@ -347,6 +487,7 @@ pub fn build(
     labels.shrink_to_fit();
     drop(offsets);
     let offsets = Offsets::new(packed);
+    let labels = Labels::new(&offsets, labels, dump.names.len());
     Ok(Graph { root: object_count as u32, offsets, targets, labels, weak, dangling, roots })
 }
 
