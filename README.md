@@ -61,9 +61,10 @@ boxed, references, garbage, system, direct and baseline. Pick them with `--only`
 
 ## Benchmark
 
-midden 0.1.0 compared with Eclipse MAT 1.17, JProfiler 16.2.1 and the VisualVM 2.2.2 heap engine,
+midden 0.2.0 compared with Eclipse MAT 1.17, JProfiler 16.2.1 and the VisualVM 2.2.2 heap engine,
 run on 8 CPUs with 4 GiB of memory. Each dump was in the page cache before its runs,
-and the tables show the best of 2 or 3 runs.
+and the tables show the best of 2 or 3 runs. The other tools were measured alongside midden 0.1.0 on the
+same machine.
 
 ### Cold first run
 
@@ -72,14 +73,14 @@ Suspects. JProfiler is `jpanalyze -retained=true`, which builds the index its GU
 
 | Dump | Objects | midden | midden, 1 thread | MAT | JProfiler | VisualVM |
 |---|---:|---:|---:|---:|---:|---:|
-| Paper server, 938 MB | 11.2 M | **1.95 seconds** | 3.62 seconds | 20.95 seconds | 12.05 seconds | 55.8 seconds |
-| mixed-small, 414 MB | 4.1 M | **0.68 seconds** | 1.21 seconds | 7.09 seconds | 4.11 seconds | 772 seconds |
-| mixed-1g, 1.2 GB | 11.8 M | **1.79 seconds** | 3.41 seconds | 17.15 seconds | 10.25 seconds | over 1,800 seconds, stopped |
-| arrays-1g, 1.2 GB | 37 k | **0.10 seconds** | 0.33 seconds | 1.84 seconds | 0.97 seconds | 0.37 seconds |
-| chain-8m, 429 MB | 8.0 M | **0.89 seconds** | 1.36 seconds | 12.26 seconds | 7.01 seconds | 23.8 seconds |
-| small-20m, 945 MB | 19.2 M | **6.92 seconds** | 14.95 seconds | 45.71 seconds | 33.46 seconds | 334 seconds |
+| Paper server, 938 MB | 11.2 M | **1.30 seconds** | 3.53 seconds | 20.95 seconds | 12.05 seconds | 55.8 seconds |
+| mixed-small, 414 MB | 4.1 M | **0.40 seconds** | 1.11 seconds | 7.09 seconds | 4.11 seconds | 772 seconds |
+| mixed-1g, 1.2 GB | 11.8 M | **1.10 seconds** | 3.78 seconds | 17.15 seconds | 10.25 seconds | over 1,800 seconds, stopped |
+| arrays-1g, 1.2 GB | 37 k | **0.08 seconds** | 0.26 seconds | 1.84 seconds | 0.97 seconds | 0.37 seconds |
+| chain-8m, 429 MB | 8.0 M | **0.85 seconds** | 1.64 seconds | 12.26 seconds | 7.01 seconds | 23.8 seconds |
+| small-20m, 945 MB | 19.2 M | **5.85 seconds** | 14.71 seconds | 45.71 seconds | 33.46 seconds | 334 seconds |
 
-midden was 7 to 18 times faster than MAT and 5 to 10 times faster than JProfiler, and it was faster on a
+midden was 8 to 23 times faster than MAT and 6 to 12 times faster than JProfiler, and it was faster on a
 single thread than either of them on eight. MAT's full three-report run (suspects, overview and top
 components) took 26 to 38 seconds on Paper.
 
@@ -87,15 +88,15 @@ components) took 26 to 38 seconds on Paper.
 
 | Dump | midden | MAT | JProfiler |
 |---|---:|---:|---:|
-| Paper | 1.66 seconds | 30.59 seconds | **1.54 seconds** |
-| small-20m | 6.74 seconds | 18.80 seconds | **3.94 seconds** |
+| Paper | **1.06 seconds** | 30.59 seconds | 1.54 seconds |
+| small-20m | 5.49 seconds | 18.80 seconds | **3.94 seconds** |
 
-JProfiler reopens faster on the large dumps because its analysis stores the dominator tree. midden's
-cache only stores the parse, so it saves at most 0.3 seconds.
+JProfiler reopens small-20m faster because its analysis stores the dominator tree. midden's cache only
+stores the parse, so it saves 0.2 to 0.4 seconds.
 
 ### Memory
 
-Peak RSS on Paper: midden 1.0 GB, JProfiler 1.3 GB, MAT 2.1 to 3.3 GB (at its 3 GB heap), VisualVM 3.5 GB.
+Peak RSS on Paper: midden 0.6 GB, JProfiler 1.3 GB, MAT 2.1 to 3.3 GB (at its 3 GB heap), VisualVM 3.5 GB.
 
 
 ### Features

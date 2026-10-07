@@ -22,6 +22,7 @@ use super::graph::{ARRAY_ELEMENT, Graph, LOADER};
 use super::hprof::RootKind;
 use super::parallel;
 use super::pattern::{Pattern, short};
+use super::store::Bits;
 
 /// Referrer label flag: the source is a class object, the field a static.
 pub const STATIC: u32 = 1 << 30;
@@ -85,7 +86,7 @@ pub struct Heap<'a> {
     /// Classes `--exclude` hides from suspects and tables.
     excluded: Vec<bool>,
     /// Per object: reachable only through weak referents.
-    weakly_reachable: Vec<bool>,
+    weakly_reachable: Bits,
 }
 
 /// A number of objects and their bytes.
@@ -112,16 +113,36 @@ pub struct Referrer {
 }
 
 impl<'a> Heap<'a> {
-    pub fn new(dump: &'a Dump, graph: &'a Graph) -> Heap<'a> {
-        // The BFS and the dominators only read the graph: run them side by side.
-        let (strong, dominators) = match parallel::threads() {
-            1 => (dom::reach(graph, dump), dom::dominators(graph, dump)),
+    /// The heap of a dump. The BFS and the dominators only read the graph, so they run side by side, and
+    /// `meanwhile` runs on the heap once the BFS is done while the dominator tree is still being built: it
+    /// must not read the tree.
+    pub fn build<T: Send>(
+        dump: &'a Dump,
+        graph: &'a Graph,
+        excludes: &[Pattern],
+        meanwhile: impl FnOnce(&Heap<'a>) -> T + Send,
+    ) -> (Heap<'a>, T) {
+        let live = || {
+            let mut heap = Heap::live(dump, graph, dom::reach(graph, dump));
+            heap.set_excludes(excludes);
+            let during = meanwhile(&heap);
+            (heap, during)
+        };
+        let ((mut heap, during), dominators) = match parallel::threads() {
+            1 => (live(), dom::dominators(graph, dump)),
             _ => std::thread::scope(|scope| {
-                let bfs = scope.spawn(|| dom::reach(graph, dump));
+                let bfs = scope.spawn(live);
                 let tree = dom::dominators(graph, dump);
                 (bfs.join().expect("reachability"), tree)
             }),
         };
+        heap.dominators = dominators;
+        heap.reachability.keep_differing(&heap.dominators.idom);
+        (heap, during)
+    }
+
+    /// A heap with liveness and its tables, and an empty dominator tree.
+    fn live(dump: &'a Dump, graph: &'a Graph, strong: Reachability) -> Heap<'a> {
         let total = dump.total_shallow();
         let weak = dom::weak_only(graph, dump, &strong);
         let unreachable = Objects {
@@ -140,7 +161,7 @@ impl<'a> Heap<'a> {
             graph,
             live: strong.bytes,
             reachability: strong,
-            dominators,
+            dominators: DominatorTree::empty(),
             total,
             weak_only: Objects { count: weak.count, bytes: weak.bytes },
             unreachable,
@@ -153,7 +174,7 @@ impl<'a> Heap<'a> {
         }
     }
 
-    pub fn set_excludes(&mut self, patterns: &[Pattern]) {
+    fn set_excludes(&mut self, patterns: &[Pattern]) {
         for (i, class) in self.dump.classes.iter().enumerate() {
             self.excluded[i] = patterns.iter().any(|pattern| pattern.matches(&class.name));
         }
@@ -178,24 +199,24 @@ impl<'a> Heap<'a> {
     }
 
     pub fn retained(&self, object: u32) -> u64 {
-        self.dominators.retained[object as usize]
+        self.dominators.retained(object)
     }
 
     pub fn shallow(&self, object: u32) -> u64 {
-        u64::from(self.dump.objects[object as usize].shallow)
+        u64::from(self.dump.objects.shallow(object as usize))
     }
 
     pub fn reachable(&self, object: u32) -> bool {
-        self.reachability.parent[object as usize] != NONE
+        self.reachability.reached(object, &self.dominators.idom)
     }
 
     /// Alive only through soft, weak or phantom references.
     pub fn weakly_reachable(&self, object: u32) -> bool {
-        self.weakly_reachable[object as usize]
+        self.weakly_reachable.get(object as usize)
     }
 
     pub fn class(&self, object: u32) -> u32 {
-        self.dump.objects[object as usize].class
+        self.dump.objects.class(object as usize)
     }
 
     pub fn is_string(&self, object: u32) -> bool {
@@ -251,7 +272,7 @@ impl<'a> Heap<'a> {
                 let object = tree.preorder[pos];
                 let group = group_of(object);
                 if !inside[group as usize] {
-                    retained[group as usize] += tree.retained[object as usize];
+                    retained[group as usize] += tree.retained(object);
                     inside[group as usize] = true;
                     open.push((tree.subtree_end[pos], group));
                 }
@@ -265,10 +286,10 @@ impl<'a> Heap<'a> {
     pub fn histogram(&self) -> Vec<ClassRow> {
         let dump = self.dump;
         let retained =
-            self.grouped_retained(|object| dump.objects[object as usize].class, dump.classes.len());
+            self.grouped_retained(|object| dump.objects.class(object as usize), dump.classes.len());
         let shallow = parallel::ranges(dump.objects.len(), |lo, hi| {
             let mut sums = vec![0u64; dump.classes.len()];
-            for record in &dump.objects[lo..hi] {
+            for record in dump.objects.range(lo, hi) {
                 sums[record.class as usize] += u64::from(record.shallow);
             }
             sums
@@ -293,7 +314,7 @@ impl<'a> Heap<'a> {
         let dump = self.dump;
         let (package_of_class, names) = dense_ids(dump.classes.iter().map(|class| package_of(&class.name)));
         let retained = self.grouped_retained(
-            |object| package_of_class[dump.objects[object as usize].class as usize],
+            |object| package_of_class[dump.objects.class(object as usize) as usize],
             names.len(),
         );
         let mut rows: Vec<(String, ClassRow)> = names
@@ -322,7 +343,7 @@ impl<'a> Heap<'a> {
         let parts = parallel::ranges(dominated.len(), |lo, hi| {
             let mut tally = Tally::new(self.dump.classes.len());
             for &member in &dominated[lo..hi] {
-                tally.add(&self.dump.objects[member as usize]);
+                tally.add(self.dump.objects.get(member as usize));
             }
             tally
         });
@@ -339,7 +360,7 @@ impl<'a> Heap<'a> {
                 if !self.reachable(source) {
                     continue;
                 }
-                let record = &self.dump.objects[source as usize];
+                let record = self.dump.objects.get(source as usize);
                 // Only a class object can be in the map; the rest skip the lookup.
                 let class_object =
                     if record.kind == Kind::Class { self.class_objects.get(&source) } else { None };
@@ -347,8 +368,10 @@ impl<'a> Heap<'a> {
                     Some(&class) => (class, STATIC),
                     None => (record.class, 0),
                 };
-                for (target, label) in graph.edges(source).iter() {
+                let edges = graph.edges(source);
+                for (k, target) in edges.targets().enumerate() {
                     if let Some(index) = slot(target) {
+                        let label = edges.coarse(k);
                         while counts.len() <= index {
                             counts.push(FastMap::default());
                         }
@@ -405,8 +428,14 @@ impl<'a> Heap<'a> {
             let dominator = self.dominators.idom[object as usize];
             dominator != root && self.class(dominator) == self.class(object)
         };
-        let mut current: Vec<u32> =
-            members.iter().copied().filter(|&object| self.reachable(object) && !same_class(object)).collect();
+        let mut current: Vec<u32> = parallel::ranges(members.len(), |lo, hi| {
+            members[lo..hi]
+                .iter()
+                .copied()
+                .filter(|&object| self.reachable(object) && !same_class(object))
+                .collect::<Vec<_>>()
+        })
+        .concat();
         let mut out = Vec::new();
         for _ in 0..6 {
             // Bytes per owning class, `NONE` standing for the roots.
@@ -415,7 +444,7 @@ impl<'a> Heap<'a> {
                 for &object in &current[lo..hi] {
                     let dominator = self.dominators.idom[object as usize];
                     let class = if dominator == root { NONE } else { self.class(dominator) };
-                    *bytes.entry(class).or_default() += self.dominators.retained[object as usize];
+                    *bytes.entry(class).or_default() += self.dominators.retained(object);
                 }
                 bytes
             });
@@ -432,29 +461,37 @@ impl<'a> Heap<'a> {
             if class == NONE {
                 break;
             }
-            let mut next: Vec<u32> = parallel::ranges(current.len(), |lo, hi| {
+            let next = parallel::ranges(current.len(), |lo, hi| {
                 current[lo..hi]
                     .iter()
                     .map(|&object| self.dominators.idom[object as usize])
                     .filter(|&dominator| dominator != root && self.class(dominator) == class)
                     .collect::<Vec<_>>()
-            })
-            .concat();
-            next.sort_unstable();
-            next.dedup();
-            current = next;
+            });
+            // Each dominator once; the order does not matter to the sums.
+            let mut listed = Bits::new(self.dump.objects.len());
+            current = next
+                .into_iter()
+                .flatten()
+                .filter(|&dominator| {
+                    !listed.get(dominator as usize) && {
+                        listed.set(dominator as usize);
+                        true
+                    }
+                })
+                .collect();
         }
         out
     }
 
     /// Root-to-object path with the label of the edge into each hop.
     pub fn root_path(&self, object: u32) -> Vec<(u32, Option<u32>)> {
-        self.labelled(&self.reachability.path(self.graph.root, object))
+        self.labelled(&self.reachability.path(self.graph.root, object, &self.dominators.idom))
     }
 
     /// Up to `limit` root paths arriving through different referrers.
     pub fn root_paths(&self, object: u32, limit: usize) -> Vec<Vec<(u32, Option<u32>)>> {
-        dom::paths(self.graph, self.dump, &self.reachability, object, limit)
+        dom::paths(self.graph, self.dump, (&self.reachability, &self.dominators.idom), object, limit)
             .into_iter()
             .map(|path| self.labelled(&path))
             .collect()
@@ -488,7 +525,7 @@ impl<'a> Heap<'a> {
     /// The object's shape without its address: class name, `class X`, `T[]`.
     pub fn kind_text(&self, object: u32) -> String {
         let dump = self.dump;
-        let record = &dump.objects[object as usize];
+        let record = dump.objects.get(object as usize);
         match self.class_objects.get(&object) {
             Some(&class) if record.kind == Kind::Class => {
                 format!("class {}", dump.classes[class as usize].name)
@@ -525,7 +562,7 @@ impl<'a> Heap<'a> {
         let mut roots: Vec<_> =
             dump.roots.iter().filter(|(rooted, _)| *rooted == object).map(|(_, root)| *root).collect();
         // A class object is a root because it is loaded; a frame holding it says less.
-        let is_class = dump.objects[object as usize].kind == Kind::Class;
+        let is_class = dump.objects.kind(object as usize) == Kind::Class;
         roots.sort_by_key(|root| (is_class && root.kind != RootKind::StickyClass, root.kind));
         let Some(root) = roots.first() else { return String::new() };
         let thread = |serial: u32| self.thread_name(serial);
@@ -596,7 +633,7 @@ impl<'a> Heap<'a> {
         let parts = parallel::ranges(self.dump.objects.len(), |lo, hi| {
             let mut best = vec![(0u64, NONE); n];
             for object in lo as u32..hi as u32 {
-                let retained = self.dominators.retained[object as usize];
+                let retained = self.dominators.retained(object);
                 let class = self.class(object) as usize;
                 if self.reachable(object) && retained > best[class].0 {
                     best[class] = (retained, object);
@@ -654,7 +691,7 @@ impl Tally {
         Tally { instances: vec![0; classes], shallow: vec![0; classes], objects: 0 }
     }
 
-    pub fn add(&mut self, record: &super::dump::Object) {
+    pub fn add(&mut self, record: super::dump::Object) {
         self.instances[record.class as usize] += 1;
         self.shallow[record.class as usize] += u64::from(record.shallow);
         self.objects += 1;

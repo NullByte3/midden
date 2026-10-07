@@ -61,9 +61,12 @@ impl Heap<'_> {
                 let mut top: Vec<(u32, u64)> = by_class.into_iter().collect();
                 top.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
                 top.truncate(5);
-                let (count, bytes) = weak_only_from(self.graph, self.dump, &self.reachability, |object| {
-                    self.ref_kind(object) == Some(kind)
-                });
+                let (count, bytes) = weak_only_from(
+                    self.graph,
+                    self.dump,
+                    (&self.reachability, &self.dominators.idom),
+                    |object| self.ref_kind(object) == Some(kind),
+                );
                 ReferenceRow { kind, references, referents, only: Objects { count, bytes }, top }
             })
             .filter(|row| row.references > 0)

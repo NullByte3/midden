@@ -15,9 +15,9 @@ impl Render<'_, '_> {
     /// An object as data; strings carry their text.
     fn object_value(&self, object: u32) -> Value {
         let (heap, dump) = (self.heap, self.heap.dump);
-        let record = &dump.objects[object as usize];
+        let record = dump.objects.get(object as usize);
         let mut item = json!({
-            "id": format!("0x{:x}", record.id),
+            "id": format!("0x{:x}", dump.objects.id(object as usize)),
             "class": heap.kind_text(object),
             "shallow": heap.shallow(object),
             "retained": heap.retained(object),

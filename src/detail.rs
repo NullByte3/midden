@@ -5,7 +5,7 @@ use std::io;
 
 use super::dump::{Dump, FastMap};
 use super::hash::{FNV_OFFSET_BASIS, FNV_PRIME, GOLDEN_RATIO};
-use super::hprof::{Body, IO_BUFFER_SIZE, Sink, Ty, Value};
+use super::hprof::{Body, IO_BUFFER_SIZE, Piece, Sink, Ty, Value};
 use super::source::Source;
 use super::strings::Needle;
 use crate::error::Result;
@@ -81,11 +81,12 @@ impl Request {
 
     /// Whether the read only keeps record bodies.
     fn records_only(&self) -> bool {
-        self.hash.is_empty()
-            && self.content.is_empty()
-            && self.boxed.is_empty()
-            && self.search.is_none()
-            && self.filter.is_none()
+        self.hash.is_empty() && self.content.is_empty() && self.by_id()
+    }
+
+    /// Whether every record the read needs is named by id, so only the pieces holding those ids are read.
+    fn by_id(&self) -> bool {
+        self.boxed.is_empty() && self.search.is_none() && self.filter.is_none()
     }
 }
 
@@ -137,16 +138,19 @@ pub fn fetch(source: &Source, dump: &Dump, mut request: Request) -> Result<Fetch
     Ok(out)
 }
 
-/// For a read of whole records alone on a seekable file, the pieces whose id
-/// range holds a wanted id, adjacent ones joined; `None` reads every chunk.
+/// For a read of records named by id on a seekable file, the pieces whose id range holds one, adjacent
+/// ones joined; `None` reads every chunk.
 fn pieces_for(source: &Source, dump: &Dump, request: &Request) -> Option<Vec<(u64, u64)>> {
-    if !request.records_only() || !source.is_seekable() || dump.pieces.is_empty() {
+    if !request.by_id() || !source.is_seekable() || dump.pieces.is_empty() {
         return None;
     }
+    let holds = |ids: &[u64], piece: &Piece| {
+        let i = ids.partition_point(|&id| id < piece.min);
+        ids.get(i).is_some_and(|&id| id <= piece.max)
+    };
     let mut ranges: Vec<(u64, u64)> = Vec::new();
     for piece in &dump.pieces {
-        let i = request.want.partition_point(|&id| id < piece.min);
-        if request.want.get(i).is_some_and(|&id| id <= piece.max) {
+        if [&request.want, &request.hash, &request.content].into_iter().any(|ids| holds(ids, piece)) {
             match ranges.last_mut() {
                 Some((_, end)) if *end == piece.start => *end = piece.end,
                 _ => ranges.push((piece.start, piece.end)),
@@ -254,16 +258,13 @@ impl Sink for Fetcher<'_> {
         if !wanted && hashed.is_none() && content.is_none() && !searched {
             return Ok(());
         }
-        let (mut string_hash, mut content_hash, mut data) = (FNV_OFFSET_BASIS, GOLDEN_RATIO, Vec::new());
-        let mut whole = Vec::new();
+        let (mut hash, mut data, mut whole) = (ArrayHash::new(), Vec::new(), Vec::new());
         body.chunks(IO_BUFFER_SIZE, |chunk| {
             if hashed.is_some() {
-                for &byte in chunk {
-                    string_hash = (string_hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME);
-                }
+                hash.string(chunk);
             }
             if content.is_some() {
-                content_hash = mix_words(content_hash, chunk);
+                hash.content(chunk);
             }
             if wanted {
                 keep(&mut data, chunk);
@@ -273,12 +274,12 @@ impl Sink for Fetcher<'_> {
             }
             Ok(())
         })?;
-        let len_bits = u64::from(len).rotate_left(u32::BITS);
+        let [string_hash, content_hash] = hash.finish(len);
         if let Some(i) = hashed {
-            self.hashes.push((i, (string_hash ^ len_bits) | 1));
+            self.hashes.push((i, string_hash));
         }
         if let Some(i) = content {
-            self.hashes.push((self.request.hash.len() + i, (content_hash ^ len_bits) | 1));
+            self.hashes.push((self.request.hash.len() + i, content_hash));
         }
         if searched && self.request.search.as_ref().is_some_and(|(_, needle)| needle.matches(ty, &whole)) {
             self.found.push(id);
@@ -287,6 +288,35 @@ impl Sink for Fetcher<'_> {
             self.raw.insert(id, RawRecord { ty, len, data });
         }
         Ok(())
+    }
+}
+
+/// An array's two hashes, fed its body in `IO_BUFFER_SIZE` chunks: FNV-1a over the bytes, the String hash
+/// the report shows, and the grouping hash for equal arrays. Both fold in the length and are never zero.
+pub struct ArrayHash {
+    string: u64,
+    content: u64,
+}
+
+impl ArrayHash {
+    pub fn new() -> ArrayHash {
+        ArrayHash { string: FNV_OFFSET_BASIS, content: GOLDEN_RATIO }
+    }
+
+    pub fn string(&mut self, chunk: &[u8]) {
+        for &byte in chunk {
+            self.string = (self.string ^ u64::from(byte)).wrapping_mul(FNV_PRIME);
+        }
+    }
+
+    pub fn content(&mut self, chunk: &[u8]) {
+        self.content = mix_words(self.content, chunk);
+    }
+
+    /// The String hash and the grouping hash.
+    pub fn finish(&self, len: u32) -> [u64; 2] {
+        let len_bits = u64::from(len).rotate_left(u32::BITS);
+        [(self.string ^ len_bits) | 1, (self.content ^ len_bits) | 1]
     }
 }
 

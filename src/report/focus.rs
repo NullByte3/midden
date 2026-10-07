@@ -104,7 +104,7 @@ impl Render<'_, '_> {
 
     pub(super) fn object(&self, out: &mut String, object: u32) {
         let (heap, dump) = (self.heap, self.heap.dump);
-        let record = &dump.objects[object as usize];
+        let record = dump.objects.get(object as usize);
         let reach = match (heap.reachable(object), heap.weakly_reachable(object)) {
             (true, _) => "reachable".to_string(),
             (false, true) => self.dim("weakly reachable"),
@@ -120,7 +120,7 @@ impl Render<'_, '_> {
                 self.percent(heap.retained(object))
             ),
         );
-        let raw = self.fetched.raw.get(&record.id);
+        let raw = self.fetched.raw.get(&heap.dump.objects.id(object as usize));
         match record.kind {
             Kind::Instance | Kind::Class => {
                 self.dim_line(out, "fields");

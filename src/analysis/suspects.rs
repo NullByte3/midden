@@ -60,7 +60,7 @@ impl Heap<'_> {
         let mut current = top;
         for _ in 0..MAX_DESCENT {
             let Some(child) = self.dominators.biggest_child(current) else { break };
-            if self.dominators.retained[child as usize] * 4 < self.dominators.retained[current as usize] * 3 {
+            if self.dominators.retained(child) * 4 < self.dominators.retained(current) * 3 {
                 break;
             }
             let label = self.graph.label_of(current, child);
@@ -85,7 +85,7 @@ impl Heap<'_> {
         let mut out = Vec::new();
         let mut inside: FastMap<u32, u64> = FastMap::default();
         for &object in self.top_level() {
-            if self.dominators.retained[object as usize] < floor {
+            if self.dominators.retained(object) < floor {
                 break;
             }
             if self.excluded(self.class(object)) {
@@ -122,17 +122,21 @@ impl Heap<'_> {
             |object: u32| bits[object as usize / u64::BITS as usize] >> (object % u64::BITS) & 1 != 0;
         let mut referrers =
             self.referrers(|target| is_member(target).then(|| slot[self.class(target) as usize] as usize));
-        let mut covered: Vec<u32> = Vec::new();
+        let mut covered = vec![false; self.dump.classes.len()];
         for (i, (&row, class_members)) in rows.iter().zip(&members).enumerate() {
-            let owned = class_members
-                .iter()
-                .filter(|&&member| {
-                    let dominator = self.dominators.idom[member as usize];
-                    dominator != self.graph.root && covered.contains(&self.class(dominator))
-                })
-                .count() as u64;
-            let seen = owned + inside.get(&row.class).copied().unwrap_or(0);
-            covered.push(row.class);
+            let owned: usize = parallel::ranges(class_members.len(), |lo, hi| {
+                class_members[lo..hi]
+                    .iter()
+                    .filter(|&&member| {
+                        let dominator = self.dominators.idom[member as usize];
+                        dominator != self.graph.root && covered[self.class(dominator) as usize]
+                    })
+                    .count()
+            })
+            .into_iter()
+            .sum();
+            let seen = owned as u64 + inside.get(&row.class).copied().unwrap_or(0);
+            covered[row.class as usize] = true;
             if seen * 2 >= row.instances {
                 continue;
             }
@@ -175,7 +179,7 @@ impl Heap<'_> {
                     until = tree.subtree_end[pos as usize];
                 }
                 if pos < until {
-                    tally.add(&dump.objects[object as usize]);
+                    tally.add(dump.objects.get(object as usize));
                 }
             }
             tally

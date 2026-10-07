@@ -6,14 +6,18 @@ use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
-use super::dump::{Buckets, Class, Dump, FastMap, Field, Kind, Object, RefKind, Slot, Static, Thread, Trace};
+use super::dump::{
+    ArrayHashes, Class, Dump, FastMap, Field, ObjectTable, Packing, RefKind, Shapes, Slot, Static, Symbols,
+    Thread, Trace,
+};
 use super::graph::{Graph, ReferencePolicy};
 use super::hash::{FNV_OFFSET_BASIS, FNV_PRIME};
 use super::hprof::{Frame, Header, IO_BUFFER_SIZE, Piece, Root, RootKind, Ty, Value};
 use super::sizes::{SizeMode, Sizing};
+use super::store::Column;
 
 const MAGIC: &[u8; 8] = b"CTDLHEAP";
-const VERSION: u32 = 5;
+const VERSION: u32 = 9;
 /// Spreads each key field before the next is folded in. Part of the file name: never change.
 const KEY_ROTATION: u32 = 17;
 /// Written for a class that is no Reference; reads back as None.
@@ -159,22 +163,23 @@ impl Reader {
         self.0.read_exact(&mut buf)?;
         String::from_utf8(buf).map_err(|_| io::ErrorKind::InvalidData.into())
     }
-    fn u32s(&mut self) -> io::Result<Vec<u32>> {
+    fn u32s(&mut self) -> io::Result<Column<u32>> {
         self.column(u32::from_le_bytes)
     }
-    fn u64s(&mut self) -> io::Result<Vec<u64>> {
+    fn u64s(&mut self) -> io::Result<Column<u64>> {
         self.column(u64::from_le_bytes)
     }
-    fn column<const N: usize, T>(&mut self, decode: impl Fn([u8; N]) -> T) -> io::Result<Vec<T>> {
+    /// A column read in batches, so the file is never held whole.
+    fn column<const N: usize, T>(&mut self, decode: impl Fn([u8; N]) -> T) -> io::Result<Column<T>> {
         let len = self.u64().and_then(|len| self.fits(len, N as u64))?;
-        let mut out = Vec::with_capacity(len);
+        let mut out = Column::with_capacity(len);
         let mut buf = vec![0u8; IO_BUFFER_SIZE];
         let mut remaining = len;
         while remaining > 0 {
             let batch = remaining.min(IO_BUFFER_SIZE / N);
             let bytes = &mut buf[..batch * N];
             self.0.read_exact(bytes)?;
-            out.extend(bytes.as_chunks::<N>().0.iter().map(|chunk| decode(*chunk)));
+            bytes.as_chunks::<N>().0.iter().for_each(|chunk| out.push(decode(*chunk)));
             remaining -= batch;
         }
         Ok(out)
@@ -209,8 +214,8 @@ pub fn save(path: &Path, key: &Key, dump: &Dump, graph: &Graph) -> io::Result<()
         writer.str(name)?;
     }
     writer.count(dump.symbols.len())?;
-    for (id, symbol) in &dump.symbols {
-        writer.u64(*id)?;
+    for (id, symbol) in dump.symbols.iter() {
+        writer.u64(id)?;
         writer.str(symbol)?;
     }
     writer.count(dump.classes.len())?;
@@ -244,12 +249,10 @@ pub fn save(path: &Path, key: &Key, dump: &Dump, graph: &Graph) -> io::Result<()
         writer.u64(class.instances)?;
         writer.u8(class.ref_kind.map_or(NO_REF_KIND, |kind| kind as u8))?;
     }
-    let (objects, count) = (&dump.objects, dump.objects.len());
-    writer.u64s(count, objects.iter().map(|object| object.id))?;
-    writer.u32s(count, objects.iter().map(|object| object.class))?;
-    writer.u32s(count, objects.iter().map(|object| object.len))?;
-    writer.u32s(count, objects.iter().map(|object| object.shallow))?;
-    writer.bytes(count, objects.iter().map(|object| [object.kind as u8]))?;
+    let (objects, shapes) = (&dump.objects, dump.objects.shapes());
+    writer.u64s(objects.len(), (0..objects.len()).map(|object| objects.id(object)))?;
+    writer.u32s(shapes.words().len(), shapes.words().iter().copied())?;
+    writer.u32s(2 * shapes.long().len(), shapes.long().iter().flat_map(|&(object, len)| [object, len]))?;
     writer.count(dump.roots.len())?;
     for (idx, root) in &dump.roots {
         writer.u32(*idx)?;
@@ -288,13 +291,34 @@ pub fn save(path: &Path, key: &Key, dump: &Dump, graph: &Graph) -> io::Result<()
     for value in [dump.class_class, dump.string_class, dump.value_label, dump.name_label] {
         writer.u32(value)?;
     }
-    let (offsets, targets, labels, weak) = graph.parts();
-    writer.u64s(offsets.len(), offsets.iter().copied())?;
+    let (targets, weak) = graph.parts();
+    let offsets = graph.offsets();
+    writer.u64s(offsets.len(), offsets)?;
     writer.u32s(targets.len(), targets.iter().copied())?;
-    writer.u32s(labels.len(), labels.iter().copied())?;
+    writer.u32s(targets.len(), graph.all_labels())?;
     writer.u32s(2 * weak.len(), weak.iter().flat_map(|&(referrer, referent)| [referrer, referent]))?;
     writer.u64(graph.dangling)?;
     writer.u32s(graph.roots.len(), graph.roots.iter().copied())?;
+    // What the index pass took for the detail read, so a cached load need not read the dump for it.
+    writer.u8(u8::from(dump.array_hashes.is_some()))?;
+    if let Some(hashes) = &dump.array_hashes {
+        let pair = |&[string, content]: &[u64; 2]| {
+            let mut bytes = [0u8; 16];
+            bytes[..8].copy_from_slice(&string.to_le_bytes());
+            bytes[8..].copy_from_slice(&content.to_le_bytes());
+            bytes
+        };
+        writer.bytes(hashes.values().len(), hashes.values().iter().map(pair))?;
+    }
+    writer.u8(u8::from(dump.boxed_values.is_some()))?;
+    if let Some(boxed) = &dump.boxed_values {
+        writer.count(boxed.len())?;
+        for (&(class, bits), &count) in boxed {
+            writer.u32(class)?;
+            writer.u64(bits)?;
+            writer.u64(count)?;
+        }
+    }
     writer.0.flush()?;
     drop(writer);
     fs::rename(&part_path, path)
@@ -336,8 +360,11 @@ fn read(mut reader: Reader, key: &Key, dump_path: &str) -> io::Result<(Dump, Gra
         .map(|piece| Piece { start: piece[0], end: piece[1], min: piece[2], max: piece[3] })
         .collect();
     let names: Vec<String> = (0..reader.u32()?).map(|_| reader.str()).collect::<io::Result<_>>()?;
-    let symbols: FastMap<u64, String> =
-        (0..reader.u32()?).map(|_| Ok((reader.u64()?, reader.str()?))).collect::<io::Result<_>>()?;
+    let mut symbols = Symbols::default();
+    for _ in 0..reader.u32()? {
+        let id = reader.u64()?;
+        symbols.insert(id, reader.str()?.as_bytes());
+    }
     let ty_from_tag = |tag: u8| Ty::from_tag(tag).ok_or_else(invalid);
     let mut classes = Vec::new();
     for _ in 0..reader.u32()? {
@@ -365,19 +392,14 @@ fn read(mut reader: Reader, key: &Key, dump_path: &str) -> io::Result<(Dump, Gra
         classes.push(class);
     }
     let ids = reader.u64s()?;
-    let class_idxs = reader.u32s()?;
-    let lens = reader.u32s()?;
-    let shallow_sizes = reader.u32s()?;
-    let count = reader.u64().and_then(|count| reader.fits(count, 1))?;
-    if [class_idxs.len(), lens.len(), shallow_sizes.len(), count].iter().any(|&len| len != ids.len()) {
+    let words = reader.u32s()?;
+    let long: Vec<(u32, u32)> =
+        reader.u32s()?.as_chunks::<2>().0.iter().map(|pair| (pair[0], pair[1])).collect();
+    let count = ids.len();
+    if words.len() != count || !long.is_sorted_by_key(|&(object, _)| object) {
         return Err(invalid());
     }
-    let mut objects = Vec::with_capacity(count);
-    for i in 0..count {
-        let kind = *Kind::ALL.get(reader.u8()? as usize).ok_or_else(invalid)?;
-        let (id, class, len, shallow) = (ids[i], class_idxs[i], lens[i], shallow_sizes[i]);
-        objects.push(Object { id, class, len, shallow, kind });
-    }
+    let shapes = Shapes::new(words, Packing::new(classes.len()), long);
     let mut roots = Vec::new();
     for _ in 0..reader.u32()? {
         let (idx, id) = (reader.u32()?, reader.u64()?);
@@ -391,7 +413,7 @@ fn read(mut reader: Reader, key: &Key, dump_path: &str) -> io::Result<(Dump, Gra
         .map(|_| Ok(Thread { object: reader.u32()?, serial: reader.u32()?, trace_serial: reader.u32()? }))
         .collect::<io::Result<_>>()?;
     let traces: HashMap<u32, Trace> = (0..reader.u32()?)
-        .map(|_| Ok((reader.u32()?, Trace { frames: reader.u64s()? })))
+        .map(|_| Ok((reader.u32()?, Trace { frames: reader.u64s()?.to_vec() })))
         .collect::<io::Result<_>>()?;
     let frames: FastMap<u64, Frame> = (0..reader.u32()?)
         .map(|_| {
@@ -410,11 +432,39 @@ fn read(mut reader: Reader, key: &Key, dump_path: &str) -> io::Result<(Dump, Gra
     let weak: Vec<(u32, u32)> =
         reader.u32s()?.as_chunks::<2>().0.iter().map(|edge| (edge[0], edge[1])).collect();
     let dangling = reader.u64()?;
-    let graph_roots = reader.u32s()?;
+    let graph_roots = reader.u32s()?.to_vec();
+    let array_hashes = if reader.u8()? == 0 {
+        None
+    } else {
+        let values = reader.column(|bytes: [u8; 16]| {
+            let (string, content) = bytes.split_at(8);
+            [
+                u64::from_le_bytes(string.try_into().unwrap_or_default()),
+                u64::from_le_bytes(content.try_into().unwrap_or_default()),
+            ]
+        })?;
+        Some(values)
+    };
+    let boxed_values = if reader.u8()? == 0 {
+        None
+    } else {
+        let entries = reader.u32()?;
+        let mut boxed = FastMap::default();
+        for _ in 0..entries {
+            let (class, bits, count) = (reader.u32()?, reader.u64()?, reader.u64()?);
+            boxed.insert((class, bits), count);
+        }
+        Some(boxed)
+    };
     if offsets.len() != count + 1 || targets.len() != labels.len() {
         return Err(invalid());
     }
-    let lookup = Buckets::build(&objects);
+    let objects = ObjectTable::from_columns(&classes, sizing, &ids, shapes);
+    drop(ids);
+    let array_hashes = match array_hashes {
+        Some(values) => Some(ArrayHashes::new(&objects, values).ok_or_else(invalid)?),
+        None => None,
+    };
     let dump = Dump {
         path: dump_path.to_string(),
         file_size,
@@ -429,6 +479,8 @@ fn read(mut reader: Reader, key: &Key, dump_path: &str) -> io::Result<(Dump, Gra
         symbols,
         classes,
         objects,
+        array_hashes,
+        boxed_values,
         roots,
         dangling_roots,
         marked_unreachable,
@@ -436,11 +488,11 @@ fn read(mut reader: Reader, key: &Key, dump_path: &str) -> io::Result<(Dump, Gra
         traces,
         frames,
         class_by_serial,
-        lookup,
         class_class,
         string_class,
         value_label,
         name_label,
     };
-    Ok((dump, Graph::from_parts(offsets, targets, labels, weak, dangling, graph_roots)))
+    let graph = Graph::from_parts(offsets, targets, labels, &dump, weak, dangling, graph_roots);
+    Ok((dump, graph))
 }

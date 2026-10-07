@@ -365,11 +365,11 @@ impl<'a> Plan<'a> {
             }
         }
         if let Some(object) = self.focus_object {
-            want.push(dump.objects[object as usize].id);
+            want.push(dump.objects.id(object as usize));
         }
         if let Some(arrays) = &self.inputs.array_duplicates {
             want.extend(
-                arrays.groups.iter().take(self.view.top).map(|group| dump.objects[group.array as usize].id),
+                arrays.groups.iter().take(self.view.top).map(|group| dump.objects.id(group.array as usize)),
             );
         }
         want
@@ -531,17 +531,18 @@ impl Render<'_, '_> {
     /// An object for a line: `java.util.HashMap @0x7f3a1234`, arrays with
     /// their length, strings with their text, class objects by class.
     fn describe(&self, object: u32) -> String {
-        let (dump, record) = (self.heap.dump, &self.heap.dump.objects[object as usize]);
+        let (dump, record) = (self.heap.dump, self.heap.dump.objects.get(object as usize));
+        let id = dump.objects.id(object as usize);
         let name = &dump.classes[record.class as usize].name;
         match record.kind {
-            Kind::Class => format!("{} @0x{:x}", self.heap.kind_text(object), record.id),
+            Kind::Class => format!("{} @0x{id:x}", self.heap.kind_text(object)),
             Kind::ObjectArray | Kind::PrimitiveArray => {
                 let base = name.strip_suffix("[]").unwrap_or(name);
-                format!("{base}[{}] @0x{:x}", commas(u64::from(record.len)), record.id)
+                format!("{base}[{}] @0x{id:x}", commas(u64::from(record.len)))
             }
             Kind::Instance => match self.text(object) {
-                Some(text) => format!("{name} \"{text}\" @0x{:x}", record.id),
-                None => format!("{name} @0x{:x}", record.id),
+                Some(text) => format!("{name} \"{text}\" @0x{id:x}"),
+                None => format!("{name} @0x{id:x}"),
             },
         }
     }

@@ -416,6 +416,18 @@ pub fn walk_chunk(reader: &mut Reader, end: u64, sink: &mut impl Sink) -> Result
     Ok(())
 }
 
+/// Read the heap sub-records before the first object, `[reader position, end)`: the class dumps and roots
+/// `HotSpot` writes first. Returns where the objects start, or `end`.
+pub fn prelude(reader: &mut Reader, end: u64, sink: &mut impl Sink) -> io::Result<u64> {
+    while reader.position() < end && !reader.at_eof() {
+        if matches!(reader.peek(), INSTANCE_DUMP | OBJ_ARRAY_DUMP | PRIM_ARRAY_DUMP | PRIM_ARRAY_NODATA) {
+            break;
+        }
+        sub_record(reader, sink)?;
+    }
+    Ok(reader.position())
+}
+
 /// End the open chunk at `at`, dropping it when empty.
 fn close_chunk(walked: &mut Walked, at: u64) {
     if let Some((start, _)) = walked.chunks.pop_if(|&mut (_, end)| end == u64::MAX)

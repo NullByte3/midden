@@ -259,7 +259,7 @@ impl Render<'_, '_> {
     /// The first elements of a primitive array, as text when it reads as text.
     pub(super) fn array_preview(&self, object: u32) -> String {
         let dump = self.heap.dump;
-        let Some(raw) = self.fetched.raw.get(&dump.objects[object as usize].id) else { return String::new() };
+        let Some(raw) = self.fetched.raw.get(&dump.objects.id(object as usize)) else { return String::new() };
         let readable = |text: &String| {
             !text.is_empty()
                 && text.chars().all(|c| !c.is_control() && c != '�')

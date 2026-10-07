@@ -9,7 +9,7 @@ use super::parallel;
 
 pub fn string_array(dump: &Dump, graph: &Graph, string: u32) -> Option<u32> {
     let array = graph.field(string, dump.value_label)?;
-    (dump.objects[array as usize].kind == Kind::PrimitiveArray).then_some(array)
+    (dump.objects.kind(array as usize) == Kind::PrimitiveArray).then_some(array)
 }
 
 /// Every String with its backing array.
@@ -19,7 +19,7 @@ pub fn strings(dump: &Dump, graph: &Graph) -> Vec<(u32, u32)> {
     }
     parallel::ranges(dump.objects.len(), |lo, hi| {
         (lo as u32..hi as u32)
-            .filter(|&object| dump.objects[object as usize].class == dump.string_class)
+            .filter(|&object| dump.objects.class(object as usize) == dump.string_class)
             .filter_map(|string| string_array(dump, graph, string).map(|array| (string, array)))
             .collect::<Vec<_>>()
     })
@@ -28,19 +28,19 @@ pub fn strings(dump: &Dump, graph: &Graph) -> Vec<(u32, u32)> {
 
 /// The ids to fetch so String `string` can be shown.
 pub fn string_ids(dump: &Dump, graph: &Graph, string: u32, want: &mut Vec<u64>) {
-    want.push(dump.objects[string as usize].id);
+    want.push(dump.objects.id(string as usize));
     if let Some(array) = string_array(dump, graph, string) {
-        want.push(dump.objects[array as usize].id);
+        want.push(dump.objects.id(array as usize));
     }
 }
 
 /// Decode a String: JDK 9+ has a `byte[]` and a `coder` (0 latin-1, 1 utf-16), older JDKs a `char[]`.
 pub fn string_text(dump: &Dump, graph: &Graph, fetched: &Fetched, string: u32) -> Option<String> {
     let backing = string_array(dump, graph, string)?;
-    let array = fetched.raw.get(&dump.objects[backing as usize].id)?;
-    let coder = fetched.raw.get(&dump.objects[string as usize].id).and_then(|raw| {
+    let array = fetched.raw.get(&dump.objects.id(backing as usize))?;
+    let coder = fetched.raw.get(&dump.objects.id(string as usize)).and_then(|raw| {
         let (offset, _) = dump
-            .field_offset(dump.objects[string as usize].class, "coder")
+            .field_offset(dump.objects.class(string as usize), "coder")
             .filter(|&(_, ty)| ty == Ty::Byte)?;
         raw.data.get(offset as usize).copied()
     });

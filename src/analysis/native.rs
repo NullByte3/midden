@@ -39,7 +39,7 @@ impl Heap<'_> {
     /// Ids the detail pass must fetch: the buffers, and the Bits counters.
     pub fn direct_wants(&self, buffers: &[u32]) -> Vec<u64> {
         let mut want: Vec<u64> =
-            buffers.iter().map(|&buffer| self.dump.objects[buffer as usize].id).collect();
+            buffers.iter().map(|&buffer| self.dump.objects.id(buffer as usize)).collect();
         for (_, value) in self.bits_statics() {
             if let Value::Ref(id) = value {
                 want.push(id);
@@ -106,7 +106,7 @@ impl Heap<'_> {
     pub fn int_field(&self, object: u32, name: &str, fetched: &Fetched) -> Option<u64> {
         let dump = self.dump;
         let (offset, ty) = dump.field_offset(self.class(object), name)?;
-        let raw = fetched.raw.get(&dump.objects[object as usize].id)?;
+        let raw = fetched.raw.get(&dump.objects.id(object as usize))?;
         match Value::decode(ty, raw.data.get(offset as usize..)?, dump.header.id_size)? {
             Value::Int(int) => Some(int as u64),
             Value::Long(long) => Some(long as u64),
