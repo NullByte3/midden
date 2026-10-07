@@ -25,10 +25,10 @@ use crate::error::{Error, Result};
 
 /// An object as the walk meets it: id, then class and kind above the length, then where its references
 /// start in the copied ids, or for a primitive array where its hashes are (`raw`).
-type Raw = [u64; 3];
+type Raw = [u64; 2];
 
-fn raw(id: u64, class: u32, kind: Kind, len: u32, references: usize) -> Raw {
-    [id, u64::from(class) << 34 | (kind as u64) << 32 | u64::from(len), references as u64]
+fn raw(id: u64, class: u32, kind: Kind, len: u32) -> Raw {
+    [id, u64::from(class) << 34 | (kind as u64) << 32 | u64::from(len)]
 }
 
 fn raw_class(record: Raw) -> u32 {
@@ -144,6 +144,9 @@ pub struct Indexer {
     name_by_text: HashMap<String, u32>,
     name_by_id: FastMap<u64, u32>,
     objects: Column<Raw>,
+    /// Per record, where its copied references start, or a primitive array's hash slot. Four bytes: the
+    /// references are only kept while they fit.
+    starts: Column<u32>,
     /// The highest object id met, which picks the size convention.
     max_id: u64,
     references: Copied<Column<u32>>,
@@ -175,6 +178,7 @@ impl Indexer {
             name_by_text: HashMap::new(),
             name_by_id: FastMap::default(),
             objects: Column::with_capacity(0),
+            starts: Column::with_capacity(0),
             max_id: 0,
             references: Copied::new(Column::with_capacity(0), 0),
             hashes: Column::with_capacity(0),
@@ -311,7 +315,8 @@ macro_rules! object_callbacks {
                 copy_instance(copied, self.id_size, body, &mut self.references, &mut self.boxed_values)?;
             }
             self.max_id = self.max_id.max(id);
-            self.objects.push(raw(id, class, Kind::Instance, len, start));
+            self.objects.push(raw(id, class, Kind::Instance, len));
+            self.starts.push(start as u32);
             Ok(())
         }
 
@@ -322,7 +327,8 @@ macro_rules! object_callbacks {
                 copy_elements(self.id_size as usize, body, &mut self.references)?;
             }
             self.max_id = self.max_id.max(id);
-            self.objects.push(raw(id, class, Kind::ObjectArray, len, start));
+            self.objects.push(raw(id, class, Kind::ObjectArray, len));
+            self.starts.push(start as u32);
             Ok(())
         }
 
@@ -331,7 +337,8 @@ macro_rules! object_callbacks {
             let at = self.hashes.len();
             self.hashes.push(hash_array(ty, len, body)?);
             self.max_id = self.max_id.max(id);
-            self.objects.push(raw(id, class, Kind::PrimitiveArray, len, at));
+            self.objects.push(raw(id, class, Kind::PrimitiveArray, len));
+            self.starts.push(at as u32);
             Ok(())
         }
     };
@@ -393,6 +400,7 @@ struct Part<'a> {
     copying: bool,
     class_dumps: Vec<ClassDump>,
     objects: Vec<Raw>,
+    starts: Vec<u32>,
     max_id: u64,
     references: Copied<Vec<u32>>,
     hashes: Vec<[u64; 2]>,
@@ -441,6 +449,7 @@ impl Sink for Part<'_> {
 struct Parsed {
     class_dumps: Vec<ClassDump>,
     objects: Vec<Raw>,
+    starts: Vec<u32>,
     max_id: u64,
     references: Copied<Vec<u32>>,
     hashes: Vec<[u64; 2]>,
@@ -503,6 +512,7 @@ impl Indexer {
                     copying,
                     class_dumps: Vec::new(),
                     objects: Vec::new(),
+                    starts: Vec::new(),
                     max_id: 0,
                     references: Copied::new(Vec::new(), base),
                     hashes: Vec::new(),
@@ -515,6 +525,7 @@ impl Indexer {
                 (!part.missed).then_some(Parsed {
                     class_dumps: part.class_dumps,
                     objects: part.objects,
+                    starts: part.starts,
                     max_id: part.max_id,
                     references: part.references,
                     hashes: part.hashes,
@@ -543,11 +554,12 @@ impl Indexer {
                     *self.boxed_values.entry(key).or_default() += count;
                 }
                 self.max_id = self.max_id.max(part.max_id);
-                self.objects.reserve(part.objects.len());
-                for &record in &part.objects {
+                self.objects.extend_from_slice(&part.objects);
+                self.starts.reserve(part.starts.len());
+                for (&record, &start) in part.objects.iter().zip(&part.starts) {
                     let base =
                         if raw_kind(record) == Kind::PrimitiveArray { hash_base } else { reference_base };
-                    self.objects.push([record[0], record[1], record[2] + base]);
+                    self.starts.push(start.wrapping_add(base as u32));
                 }
                 self.roots.extend(part.roots);
                 walked.chunks.extend(part.walked.chunks);
@@ -709,28 +721,24 @@ impl Indexer {
         for class in self.classes.iter().filter(|class| class.dumped) {
             let statics_size: u64 =
                 class.statics.iter().map(|field| u64::from(sizing.field_size(field.ty))).sum();
-            class_objects.push(raw(
-                class.id,
-                class_class,
-                Kind::Class,
-                sizing.instance_size(statics_size),
-                0,
-            ));
+            class_objects.push(raw(class.id, class_class, Kind::Class, sizing.instance_size(statics_size)));
         }
         class_objects.sort_by_key(|record| record[0]);
+        let class_starts = vec![0u32; class_objects.len()];
         let records = std::mem::replace(&mut self.objects, Column::with_capacity(0));
+        let starts = std::mem::replace(&mut self.starts, Column::with_capacity(0));
         // HotSpot writes by address in runs: merge the runs, earlier ones first on equal ids, which is
         // a stable sort. The first record of each id is kept.
-        let mut runs: Vec<&[Raw]> = Vec::new();
+        let mut runs: Vec<Run> = Vec::new();
         let mut start = 0;
         for i in 1..=records.len() {
             if i == records.len() || records[i][0] < records[i - 1][0] {
-                runs.push(&records[start..i]);
+                runs.push((&records[start..i], &starts[start..i]));
                 start = i;
             }
         }
-        runs.push(&class_objects);
-        runs.retain(|run| !run.is_empty());
+        runs.push((&class_objects, &class_starts));
+        runs.retain(|run| !run.0.is_empty());
         let hashes = std::mem::replace(&mut self.hashes, Column::with_capacity(0));
         let merged = merge_table(&runs, &hashes, self.classes.len(), keep);
         let table = ObjectTable::from_steps(&self.classes, sizing, merged.ids, merged.shapes);
@@ -741,16 +749,19 @@ impl Indexer {
     }
 }
 
+/// A run of records in id order, and where each one's references start (or its hash slot).
+type Run<'a> = (&'a [Raw], &'a [u32]);
+
 /// The merge of sorted runs as stretches in output order, `(run, start, end)`: id order, an earlier run
 /// first on equal ids, which is a stable sort. A stretch runs from the smallest head up to the next one.
-fn merge_stretches(runs: &[&[Raw]]) -> Vec<(usize, usize, usize)> {
+fn merge_stretches(runs: &[Run]) -> Vec<(usize, usize, usize)> {
     let mut at = vec![0usize; runs.len()];
-    let head = |run: usize, at: &[usize]| runs[run].get(at[run]).map(|record| Reverse((record[0], run)));
+    let head = |run: usize, at: &[usize]| runs[run].0.get(at[run]).map(|record| Reverse((record[0], run)));
     let mut heads: BinaryHeap<Reverse<(u64, usize)>> =
         (0..runs.len()).filter_map(|run| head(run, &at)).collect();
     let mut stretches = Vec::new();
     while let Some(Reverse((_, run))) = heads.pop() {
-        let rest = &runs[run][at[run]..];
+        let rest = &runs[run].0[at[run]..];
         let len = match heads.peek() {
             None => rest.len(),
             Some(&Reverse(next)) => rest.partition_point(|record| (record[0], run) < next).max(1),
@@ -773,9 +784,10 @@ struct Merged {
 
 /// Merge the runs into the table's columns, one of each id kept (the first), over the workers: each
 /// stretch is counted first, so every worker knows where its stretches' objects go.
-fn merge_table(runs: &[&[Raw]], hashes: &[[u64; 2]], class_count: usize, keep: bool) -> Merged {
+fn merge_table(runs: &[Run], hashes: &[[u64; 2]], class_count: usize, keep: bool) -> Merged {
     let stretches = merge_stretches(runs);
-    let records = |&(run, start, end): &(usize, usize, usize)| &runs[run][start..end];
+    let records = |&(run, start, end): &(usize, usize, usize)| &runs[run].0[start..end];
+    let starts_of = |&(run, start, end): &(usize, usize, usize)| &runs[run].1[start..end];
     let last_id = |k: usize| {
         k.checked_sub(1).map(|k| records(&stretches[k]).last().expect("stretches are not empty")[0])
     };
@@ -844,7 +856,7 @@ fn merge_table(runs: &[&[Raw]], hashes: &[[u64; 2]], class_count: usize, keep: b
             let (mut instances, mut long) = (vec![0u64; class_count], Vec::new());
             let (mut at, mut array_at, mut previous) = (0, 0, last_id(lo));
             for stretch in &stretches[lo..hi] {
-                for &record in records(stretch) {
+                for (&record, &start) in records(stretch).iter().zip(starts_of(stretch)) {
                     if previous == Some(record[0]) {
                         continue;
                     }
@@ -852,7 +864,7 @@ fn merge_table(runs: &[&[Raw]], hashes: &[[u64; 2]], class_count: usize, keep: b
                     let (class, kind) = (raw_class(record), raw_kind(record));
                     instances[class as usize] += 1;
                     if kind == Kind::PrimitiveArray {
-                        value_part[array_at] = hashes[record[2] as usize];
+                        value_part[array_at] = hashes[start as usize];
                         array_at += 1;
                     }
                     if narrow {
@@ -866,7 +878,7 @@ fn merge_table(runs: &[&[Raw]], hashes: &[[u64; 2]], class_count: usize, keep: b
                     shape_part[at] = word;
                     long.extend(too_long.map(|len| ((first_object + at) as u32, len)));
                     if keep {
-                        start_part[at] = record[2] as u32;
+                        start_part[at] = start;
                     }
                     at += 1;
                 }

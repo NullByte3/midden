@@ -527,6 +527,8 @@ fn step_of(base: u64, id: u64) -> Option<u32> {
 
 /// Buckets widen until the id span needs at most this many.
 const MAX_BUCKETS: u64 = 1 << 22;
+/// Objects a bucket holds on average, at least.
+const OBJECTS_PER_BUCKET: u64 = 4;
 
 /// The object table bucketed by address range: a short binary search per id, not a hash lookup.
 struct Buckets {
@@ -545,8 +547,9 @@ impl Buckets {
         let Some(last) = table.len().checked_sub(1) else { return Buckets::empty() };
         let (min, max) = (table.id(0), table.id(last));
         let span = max - min + 1;
+        let limit = (table.len() as u64 / OBJECTS_PER_BUCKET).clamp(1, MAX_BUCKETS);
         let mut shift = 0;
-        while (span >> shift) > MAX_BUCKETS {
+        while (span >> shift) > limit {
             shift += 1;
         }
         let bucket_count = ((span - 1) >> shift) as usize + 1;

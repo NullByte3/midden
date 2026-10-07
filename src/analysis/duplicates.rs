@@ -83,27 +83,20 @@ struct HashGroup<T> {
     wasted: u64,
 }
 
-/// Group `items` by hash over the workers, each taking one share of the hashes.
+/// Group `items` by hash over the workers, each taking one share of the hashes and reading every item
+/// for it, so nothing is copied out. `hash` gets an item's place too; `None` leaves the item out.
 fn group_by_hash<T: Copy + Send + Sync>(
     items: &[T],
-    hash: impl Fn(T) -> Option<u64> + Sync,
+    hash: impl Fn(usize, T) -> Option<u64> + Sync,
     rank: impl Fn(T) -> u32 + Sync,
     bytes: impl Fn(T) -> u64 + Sync,
 ) -> Vec<HashGroup<T>> {
     let shares = parallel::threads();
-    let parts = parallel::ranges(items.len(), |lo, hi| {
-        let mut out = vec![Vec::new(); shares];
-        for &item in &items[lo..hi] {
-            if let Some(hash) = hash(item) {
-                out[(hash >> 32) as usize % shares].push((hash, item));
-            }
-        }
-        out
-    });
     let share_ids: Vec<usize> = (0..shares).collect();
     parallel::items(&share_ids, |&share| {
         let mut groups: FastMap<u64, (T, u64, u64)> = FastMap::default();
-        for &(hash, item) in parts.iter().flat_map(|part| &part[share]) {
+        let mine = items.iter().enumerate().filter_map(|(at, &item)| Some((hash(at, item)?, item)));
+        for (hash, item) in mine.filter(|&(hash, _)| (hash >> 32) as usize % shares == share) {
             let group = groups.entry(hash).or_insert((item, 0, 0));
             if rank(item) < rank(group.0) {
                 group.0 = item;
@@ -134,18 +127,19 @@ impl Heap<'_> {
         hash_of: impl Fn(u32) -> Option<u64> + Sync,
     ) -> Duplicates {
         // Each array once, with its first String: the pairs come in String order.
-        let mut shared = Bits::new(self.dump.objects.len());
-        let mut seen: Vec<(u32, u32)> = Vec::with_capacity(pairs.len());
-        for &(string, array) in pairs {
+        let (mut shared, mut first) = (Bits::new(self.dump.objects.len()), Bits::new(pairs.len()));
+        let mut seen = 0;
+        for (at, &(_, array)) in pairs.iter().enumerate() {
             if !shared.get(array as usize) {
                 shared.set(array as usize);
-                seen.push((string, array));
+                first.set(at);
+                seen += 1;
             }
         }
         drop(shared);
         let groups = group_by_hash(
-            &seen,
-            |(_, array)| hash_of(array),
+            pairs,
+            |at, (_, array)| first.get(at).then(|| hash_of(array)).flatten(),
             |(_, array)| array,
             |(string, array)| self.shallow(array) + self.shallow(string),
         );
@@ -162,7 +156,7 @@ impl Heap<'_> {
         Duplicates {
             wasted: out.iter().map(|group| group.wasted).sum(),
             groups: out,
-            strings: seen.len() as u64,
+            strings: seen,
             distinct,
         }
     }
@@ -193,7 +187,8 @@ impl Heap<'_> {
         arrays: &[u32],
         hash_of: impl Fn(u32) -> Option<u64> + Sync,
     ) -> ArrayDuplicates {
-        let groups = group_by_hash(arrays, hash_of, |array| array, |array| self.shallow(array));
+        let groups =
+            group_by_hash(arrays, |_, array| hash_of(array), |array| array, |array| self.shallow(array));
         let distinct = groups.len() as u64;
         let mut out: Vec<ArrayGroup> = groups
             .into_iter()
