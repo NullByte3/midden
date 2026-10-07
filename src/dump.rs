@@ -75,7 +75,12 @@ pub const MAX_CLASSES: usize = 1 << (u32::BITS - KIND_BITS);
 /// The object table, sorted by id, as columns: ids, and class with kind plus length. Shallow sizes are
 /// worked out on read from the class and length; a class object keeps its own in the length slot.
 pub struct ObjectTable {
-    ids: Column<u64>,
+    /// Ids as 8-byte steps above the first (the lowest): four bytes each while every id fits, else `wide`
+    /// holds them whole.
+    steps: Column<u32>,
+    wide: Option<Column<u64>>,
+    base: u64,
+    lookup: Buckets,
     shapes: Column<[u32; 2]>,
     /// Per class: an instance's shallow size, and an array element's footprint.
     instance_shallow: Vec<u32>,
@@ -87,7 +92,10 @@ impl ObjectTable {
     /// A table for these classes and sizes, filled by [`ObjectTable::push`].
     pub fn new(classes: &[Class], sizing: Sizing, capacity: usize) -> ObjectTable {
         ObjectTable {
-            ids: Column::with_capacity(capacity),
+            steps: Column::with_capacity(capacity),
+            wide: None,
+            base: 0,
+            lookup: Buckets::empty(),
             shapes: Column::with_capacity(capacity),
             instance_shallow: classes.iter().map(|class| class.shallow).collect(),
             element_size: classes
@@ -102,11 +110,15 @@ impl ObjectTable {
     pub fn from_columns(
         classes: &[Class],
         sizing: Sizing,
-        ids: Column<u64>,
+        ids: &[u64],
         shapes: Column<[u32; 2]>,
     ) -> ObjectTable {
-        let mut table = ObjectTable::new(classes, sizing, 0);
-        (table.ids, table.shapes) = (ids, shapes);
+        let mut table = ObjectTable::new(classes, sizing, ids.len());
+        for &id in ids {
+            table.push_id(id);
+        }
+        table.shapes = shapes;
+        table.index();
         table
     }
 
@@ -115,27 +127,65 @@ impl ObjectTable {
         &self.shapes
     }
 
-    /// Append an object; `len` is the shallow size for a class object.
+    /// Append an object, ids ascending; `len` is the shallow size for a class object.
     pub fn push(&mut self, id: u64, class: u32, kind: Kind, len: u32) {
-        self.ids.push(id);
+        self.push_id(id);
         self.shapes.push([class << KIND_BITS | kind as u32, len]);
     }
 
+    fn push_id(&mut self, id: u64) {
+        if self.steps.is_empty() && self.wide.is_none() {
+            self.base = id;
+        }
+        if let Some(wide) = &mut self.wide {
+            wide.push(id);
+            return;
+        }
+        if let Some(step) = self.step_of(id) {
+            self.steps.push(step);
+        } else {
+            // An id past four bytes of steps: keep them all whole from here on.
+            let mut wide = Column::with_capacity(self.shapes.len() + 1);
+            wide.extend(self.steps.iter().map(|&step| self.base + (u64::from(step) << 3)));
+            wide.push(id);
+            self.steps = Column::with_capacity(0);
+            self.wide = Some(wide);
+        }
+    }
+
+    fn step_of(&self, id: u64) -> Option<u32> {
+        let distance = id.checked_sub(self.base).filter(|distance| distance.trailing_zeros() >= 3)?;
+        u32::try_from(distance >> 3).ok()
+    }
+
+    /// Bucket the ids for lookups, once they are all in.
+    pub fn index(&mut self) {
+        self.lookup = Buckets::build(self);
+    }
+
     pub fn len(&self) -> usize {
-        self.ids.len()
+        self.shapes.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.ids.is_empty()
-    }
-
-    /// Sorted ids, for lookups.
-    pub fn ids(&self) -> &[u64] {
-        &self.ids
+        self.shapes.is_empty()
     }
 
     pub fn id(&self, object: usize) -> u64 {
-        self.ids[object]
+        match &self.wide {
+            Some(wide) => wide[object],
+            None => self.base + (u64::from(self.steps[object]) << 3),
+        }
+    }
+
+    /// The index of the object with this id.
+    pub fn lookup(&self, id: u64) -> Option<u32> {
+        let (lo, hi) = self.lookup.range(id)?;
+        let found = match &self.wide {
+            Some(wide) => wide[lo..hi].binary_search(&id),
+            None => self.steps[lo..hi].binary_search(&self.step_of(id)?),
+        };
+        found.ok().map(|i| (lo + i) as u32)
     }
 
     pub fn class(&self, object: usize) -> u32 {
@@ -166,7 +216,7 @@ impl ObjectTable {
         let kind = Kind::ALL[(shape[0] & ((1 << KIND_BITS) - 1)) as usize];
         let len = if kind == Kind::Class { 0 } else { shape[1] };
         Object {
-            id: self.ids[object],
+            id: self.id(object),
             class: shape[0] >> KIND_BITS,
             len,
             shallow: self.shape_shallow(shape),
@@ -318,7 +368,6 @@ pub struct Dump {
     pub traces: HashMap<u32, Trace>,
     pub frames: FastMap<u64, Frame>,
     pub class_by_serial: HashMap<u32, u32>,
-    pub lookup: Buckets,
     /// `java.lang.Class`, `java.lang.String`, and the `value` / `name` labels.
     pub class_class: u32,
     pub string_class: u32,
@@ -330,7 +379,7 @@ pub struct Dump {
 const MAX_BUCKETS: u64 = 1 << 22;
 
 /// The object table bucketed by address range: a short binary search per id, not a hash lookup.
-pub struct Buckets {
+struct Buckets {
     min: u64,
     max: u64,
     shift: u32,
@@ -338,10 +387,13 @@ pub struct Buckets {
 }
 
 impl Buckets {
-    pub fn build(ids: &[u64]) -> Buckets {
-        let (Some(&min), Some(&max)) = (ids.first(), ids.last()) else {
-            return Buckets { min: 1, max: 0, shift: 0, starts: vec![0, 0] };
-        };
+    fn empty() -> Buckets {
+        Buckets { min: 1, max: 0, shift: 0, starts: vec![0, 0] }
+    }
+
+    fn build(table: &ObjectTable) -> Buckets {
+        let Some(last) = table.len().checked_sub(1) else { return Buckets::empty() };
+        let (min, max) = (table.id(0), table.id(last));
         let span = max - min + 1;
         let mut shift = 0;
         while (span >> shift) > MAX_BUCKETS {
@@ -349,8 +401,8 @@ impl Buckets {
         }
         let bucket_count = ((span - 1) >> shift) as usize + 1;
         let mut starts = vec![0u32; bucket_count + 1];
-        for &id in ids {
-            starts[((id - min) >> shift) as usize + 1] += 1;
+        for object in 0..table.len() {
+            starts[((table.id(object) - min) >> shift) as usize + 1] += 1;
         }
         for i in 0..bucket_count {
             starts[i + 1] += starts[i];
@@ -358,13 +410,13 @@ impl Buckets {
         Buckets { min, max, shift, starts }
     }
 
-    pub fn find(&self, ids: &[u64], id: u64) -> Option<u32> {
+    /// The table range an id would be in.
+    fn range(&self, id: u64) -> Option<(usize, usize)> {
         if id < self.min || id > self.max {
             return None;
         }
         let bucket = ((id - self.min) >> self.shift) as usize;
-        let (lo, hi) = (self.starts[bucket] as usize, self.starts[bucket + 1] as usize);
-        ids[lo..hi].binary_search(&id).ok().map(|i| (lo + i) as u32)
+        Some((self.starts[bucket] as usize, self.starts[bucket + 1] as usize))
     }
 }
 
@@ -457,7 +509,7 @@ pub fn package_of(name: &str) -> &str {
 
 impl Dump {
     pub fn lookup(&self, id: u64) -> Option<u32> {
-        self.lookup.find(self.objects.ids(), id)
+        self.objects.lookup(id)
     }
 
     pub fn class_of(&self, object: u32) -> &Class {

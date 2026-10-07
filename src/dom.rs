@@ -14,10 +14,13 @@ const MAX_CHAIN_LEN: usize = 50_000_000;
 /// A level this wide or wider is split over the workers; narrower ones run on the calling thread.
 const PARALLEL_LEVEL: usize = 1 << 14;
 
-/// Breadth-first reachability. `parent` is the previous hop on a shortest
-/// path from a root (`graph.root` for roots, `NONE` when unreachable).
+/// Breadth-first reachability. An object's parent is the previous hop on a shortest path from a root
+/// (`graph.root` for roots, `NONE` when unreachable).
 pub struct Reachability {
-    pub parent: Column<u32>,
+    /// Every object's parent, until [`Reachability::keep_differing`] leaves only those in `differing`.
+    parent: Column<u32>,
+    /// Objects whose parent is not their idom, and the parent, by object.
+    differing: Vec<(u32, u32)>,
     pub count: u64,
     pub bytes: u64,
 }
@@ -111,19 +114,50 @@ fn reach_blocking(graph: &Graph, dump: &Dump, blocked: &[(u32, u32)]) -> Reachab
     })
     .into_iter()
     .sum();
-    Reachability { parent: parent_column, count: order.len() as u64, bytes }
+    Reachability { parent: parent_column, differing: Vec::new(), count: order.len() as u64, bytes }
 }
 
 impl Reachability {
+    /// An object's parent; `idom` answers for most once only the differing parents are kept.
+    pub fn parent(&self, object: u32, idom: &[u32]) -> u32 {
+        if !self.parent.is_empty() {
+            return self.parent[object as usize];
+        }
+        match self.differing.binary_search_by_key(&object, |&(differs, _)| differs) {
+            Ok(i) => self.differing[i].1,
+            Err(_) => idom[object as usize],
+        }
+    }
+
+    /// Whether a root reaches `object`: it has a parent, or once only the differing ones are kept, an idom.
+    pub fn reached(&self, object: u32, idom: &[u32]) -> bool {
+        let source = if self.parent.is_empty() { idom } else { &self.parent };
+        source[object as usize] != NONE
+    }
+
+    /// Drop every parent that equals the object's idom. An object with one referrer has it as both, so
+    /// few parents stay.
+    pub fn keep_differing(&mut self, idom: &[u32]) {
+        let parent = &self.parent;
+        self.differing = parallel::ranges(parent.len(), |lo, hi| {
+            (lo as u32..hi as u32)
+                .filter(|&object| parent[object as usize] != idom[object as usize])
+                .map(|object| (object, parent[object as usize]))
+                .collect::<Vec<_>>()
+        })
+        .concat();
+        self.parent = Column::with_capacity(0);
+    }
+
     /// Root-to-object path, the root end first. Empty when unreachable.
-    pub fn path(&self, root: u32, mut object: u32) -> Vec<u32> {
+    pub fn path(&self, root: u32, mut object: u32, idom: &[u32]) -> Vec<u32> {
         let mut path = Vec::new();
-        if self.parent[object as usize] == NONE {
+        if !self.reached(object, idom) {
             return path;
         }
         while object != NONE && object != root {
             path.push(object);
-            object = self.parent[object as usize];
+            object = self.parent(object, idom);
             if path.len() > MAX_CHAIN_LEN {
                 break;
             }
@@ -135,12 +169,18 @@ impl Reachability {
 
 /// Up to `limit` root paths to `target` that arrive through different referrers: each
 /// search blocks the last edge of the paths found so far.
-pub fn paths(graph: &Graph, dump: &Dump, first: &Reachability, target: u32, limit: usize) -> Vec<Vec<u32>> {
+pub fn paths(
+    graph: &Graph,
+    dump: &Dump,
+    (first, idom): (&Reachability, &[u32]),
+    target: u32,
+    limit: usize,
+) -> Vec<Vec<u32>> {
     let mut out = Vec::new();
     let mut blocked = Vec::new();
     let mut reach = None;
     for _ in 0..limit.max(1) {
-        let path = reach.as_ref().unwrap_or(first).path(graph.root, target);
+        let path = reach.as_ref().unwrap_or(first).path(graph.root, target, idom);
         if path.is_empty() {
             break;
         }
@@ -165,31 +205,36 @@ pub struct WeakSet {
 
 /// The weakly-held set: a search seeded by weak edges leaving the strongly reachable set.
 pub fn weak_only(graph: &Graph, dump: &Dump, strong: &Reachability) -> WeakSet {
-    weak_set(graph, dump, strong, |_| true)
+    weak_set(graph, dump, (strong, &[]), |_| true)
 }
 
 /// Count and bytes of the weakly-held set reached through the weak edges `take` accepts.
 pub fn weak_only_from(
     graph: &Graph,
     dump: &Dump,
-    strong: &Reachability,
+    strong: (&Reachability, &[u32]),
     take: impl Fn(u32) -> bool,
 ) -> (u64, u64) {
     let set = weak_set(graph, dump, strong, take);
     (set.count, set.bytes)
 }
 
-fn weak_set(graph: &Graph, dump: &Dump, strong: &Reachability, take: impl Fn(u32) -> bool) -> WeakSet {
+fn weak_set(
+    graph: &Graph,
+    dump: &Dump,
+    (strong, idom): (&Reachability, &[u32]),
+    take: impl Fn(u32) -> bool,
+) -> WeakSet {
     let mut seen = Bits::new(dump.objects.len());
     let mut queue: Vec<u32> = Vec::new();
     let visit = |object: u32, queue: &mut Vec<u32>, seen: &mut Bits| {
-        if strong.parent[object as usize] == NONE && !seen.get(object as usize) {
+        if !strong.reached(object, idom) && !seen.get(object as usize) {
             seen.set(object as usize);
             queue.push(object);
         }
     };
     for &(referrer, referent) in graph.weak_edges() {
-        if strong.parent[referrer as usize] != NONE && take(referrer) {
+        if strong.reached(referrer, idom) && take(referrer) {
             visit(referent, &mut queue, &mut seen);
         }
     }
@@ -212,8 +257,10 @@ fn weak_set(graph: &Graph, dump: &Dump, strong: &Reachability, take: impl Fn(u32
 pub struct DominatorTree {
     /// Immediate dominator: `graph.root` for top-level objects, `NONE` if unreachable.
     pub idom: Column<u32>,
-    /// Shallow size plus everything dominated; unreachable objects keep their shallow size.
-    pub retained: Column<u64>,
+    /// Shallow size plus everything dominated; unreachable objects keep their shallow size. Four bytes: an
+    /// object retaining 4 GiB or more reads `u32::MAX` here and has its size in `big`.
+    retained: Column<u32>,
+    big: Vec<(u32, u64)>,
     /// Objects dominated by the roots alone, biggest retained first.
     top_level: Vec<u32>,
     /// Reachable objects in tree preorder: what an object dominates runs from its place to its `subtree_end`.
@@ -230,10 +277,18 @@ impl DominatorTree {
         DominatorTree {
             idom: none(),
             retained: Column::with_capacity(0),
+            big: Vec::new(),
             top_level: Vec::new(),
             preorder: none(),
             subtree_end: none(),
             preorder_index: none(),
+        }
+    }
+
+    pub fn retained(&self, object: u32) -> u64 {
+        match self.retained[object as usize] {
+            u32::MAX => self.big.binary_search_by_key(&object, |&(big, _)| big).map_or(0, |i| self.big[i].1),
+            bytes => u64::from(bytes),
         }
     }
 
@@ -254,7 +309,7 @@ impl DominatorTree {
     }
 
     fn bigger(&self, a: u32, b: u32) -> std::cmp::Ordering {
-        self.retained[b as usize].cmp(&self.retained[a as usize]).then(a.cmp(&b))
+        self.retained(b).cmp(&self.retained(a)).then(a.cmp(&b))
     }
 
     /// Children in preorder: each child's subtree ends where the next begins.
@@ -469,10 +524,10 @@ pub fn dominators(graph: &Graph, dump: &Dump) -> DominatorTree {
     drop((semi, parent));
 
     // Each leaf meets its referrers at their nearest common ancestor, by DFS number plus one (zero: not
-    // reached). The meet does not depend on the order referrers arrive in.
-    let mut leaf_dominator = Column::<u32>::zeroed(object_count);
+    // reached), kept where its idom goes. The meet does not depend on the order referrers arrive in.
+    let mut idom = Column::<u32>::zeroed(object_count);
     {
-        let leaf = leaf_dominator.atomics();
+        let leaf = idom.atomics();
         let ancestor = |mut a: u32, mut b: u32| {
             while a != b {
                 if a > b {
@@ -522,10 +577,10 @@ pub fn dominators(graph: &Graph, dump: &Dump) -> DominatorTree {
     {
         let (bytes, counts) = (subtree_bytes.atomics(), size.atomics());
         parallel::ranges(object_count, |lo, hi| {
-            for (object, &dominator) in (lo..hi).zip(&leaf_dominator[lo..hi]) {
-                if dominator != 0 {
-                    bytes[dominator as usize - 1].fetch_add(u64::from(dump.objects.shallow(object)), Relaxed);
-                    counts[dominator as usize - 1].fetch_add(1, Relaxed);
+            for (object, (&leaf, &number)) in (lo..hi).zip(idom[lo..hi].iter().zip(&dfs_number[lo..hi])) {
+                if number == LEAF && leaf != 0 {
+                    bytes[leaf as usize - 1].fetch_add(u64::from(dump.objects.shallow(object)), Relaxed);
+                    counts[leaf as usize - 1].fetch_add(1, Relaxed);
                 }
             }
         });
@@ -537,76 +592,94 @@ pub fn dominators(graph: &Graph, dump: &Dump) -> DominatorTree {
     }
     // Map each result back to object indices once final, so fewer arrays stand at once.
     // Leaves and unreachable objects keep their shallow size.
-    let mut retained = Column::<u64>::zeroed(object_count);
-    parallel::chunks(&mut retained, |start, part| {
-        for ((bytes, &number), shallow) in part
+    let mut retained = Column::<u32>::zeroed(object_count);
+    let big = parallel::chunks(&mut retained, |start, part| {
+        let mut big = Vec::new();
+        for (((bytes, &number), shallow), object) in part
             .iter_mut()
             .zip(&dfs_number[start..])
             .zip(dump.objects.shallow_range(start, dump.objects.len()))
+            .zip(start as u32..)
         {
-            *bytes = if number >= LEAF { u64::from(shallow) } else { subtree_bytes[number as usize] };
+            let total = if number >= LEAF { u64::from(shallow) } else { subtree_bytes[number as usize] };
+            *bytes = u32::try_from(total).unwrap_or(u32::MAX);
+            if *bytes == u32::MAX {
+                big.push((object, total));
+            }
+        }
+        big
+    })
+    .concat();
+    drop(subtree_bytes);
+    // Idoms as objects, in place: a leaf's slot held its dominator's number plus one.
+    parallel::chunks(&mut idom, |start, part| {
+        for (dominator, &number) in part.iter_mut().zip(&dfs_number[start..]) {
+            *dominator = match number {
+                NONE => NONE,
+                LEAF if *dominator == 0 => NONE,
+                LEAF => vertex[*dominator as usize - 1],
+                number => vertex[dom[number as usize] as usize],
+            };
         }
     });
-    drop(subtree_bytes);
-    // A preorder in which each subtree is one range: an object takes its
-    // dominator's next free place, and DFS numbers put dominators first.
-    // Leaves then take what is left of their dominator's range.
+    // A preorder in which each subtree is one range: an object takes its dominator's next free place,
+    // and DFS numbers put dominators first. Places go where the dominators were, each read before its
+    // own place is written. Leaves then take what is left of their dominator's range.
     let reachable = size[0] as usize - 1;
-    let (mut place, mut next_free) =
-        (Column::<u32>::zeroed(vertex_count), Column::<u32>::zeroed(vertex_count));
+    let mut next_free = Column::<u32>::zeroed(vertex_count);
+    let mut place = dom;
     for number in 1..vertex_count {
-        let dominator = dom[number] as usize;
+        let dominator = place[number] as usize;
         place[number] = next_free[dominator];
         next_free[dominator] += size[number];
         next_free[number] = place[number] + 1;
     }
     let (mut preorder, mut subtree_end) =
         (Column::<u32>::zeroed(reachable), Column::<u32>::zeroed(reachable));
-    let mut idom = Column::<u32>::zeroed(object_count);
-    parallel::chunks(&mut idom, |start, part| {
-        for ((dominator, &number), &leaf) in
-            part.iter_mut().zip(&dfs_number[start..]).zip(&leaf_dominator[start..])
-        {
-            *dominator = match number {
-                NONE => NONE,
-                LEAF if leaf == 0 => NONE,
-                LEAF => vertex[leaf as usize - 1],
-                number => vertex[dom[number as usize] as usize],
-            };
-        }
-    });
-    drop(dom);
+    dfs_number.truncate(object_count + 1);
     {
-        let (preorder, subtree_end, free) = (preorder.atomics(), subtree_end.atomics(), next_free.atomics());
+        let (preorder, subtree_end) = (preorder.atomics(), subtree_end.atomics());
+        let (free, numbers) = (next_free.atomics(), dfs_number.atomics());
         parallel::ranges(vertex_count - 1, |lo, hi| {
             for number in (lo + 1)..=hi {
                 preorder[place[number] as usize].store(vertex[number], Relaxed);
                 subtree_end[place[number] as usize].store(place[number] + size[number], Relaxed);
             }
         });
-        // Last, turn DFS numbers into preorder places, placing the leaves.
-        dfs_number.truncate(object_count);
-        parallel::chunks(&mut dfs_number, |start, part| {
-            for ((number, object), &leaf) in part.iter_mut().zip(start as u32..).zip(&leaf_dominator[start..])
-            {
-                *number = match *number {
+        // A leaf's dominator is a vertex, whose entry still holds its number: the leaf writes only its own.
+        parallel::ranges(object_count, |lo, hi| {
+            for object in lo..hi {
+                if numbers[object].load(Relaxed) != LEAF {
+                    continue;
+                }
+                let at = match idom[object] {
                     NONE => NONE,
-                    LEAF if leaf == 0 => NONE,
-                    LEAF => {
-                        let at = free[leaf as usize - 1].fetch_add(1, Relaxed);
-                        preorder[at as usize].store(object, Relaxed);
+                    dominator => {
+                        let at =
+                            free[numbers[dominator as usize].load(Relaxed) as usize].fetch_add(1, Relaxed);
+                        preorder[at as usize].store(object as u32, Relaxed);
                         subtree_end[at as usize].store(at + 1, Relaxed);
                         at
                     }
-                    number => place[number as usize],
                 };
+                numbers[object].store(at, Relaxed);
             }
         });
     }
-    drop((place, next_free, size, vertex, leaf_dominator));
+    // Last, the vertices' DFS numbers become their places.
+    {
+        let numbers = dfs_number.atomics();
+        parallel::ranges(vertex_count - 1, |lo, hi| {
+            for number in (lo + 1)..=hi {
+                numbers[vertex[number] as usize].store(place[number], Relaxed);
+            }
+        });
+    }
+    drop((place, next_free, size, vertex));
+    dfs_number.truncate(object_count);
     let preorder_index = dfs_number;
     let mut tree =
-        DominatorTree { idom, retained, top_level: Vec::new(), preorder, subtree_end, preorder_index };
+        DominatorTree { idom, retained, big, top_level: Vec::new(), preorder, subtree_end, preorder_index };
     tree.top_level = tree.children(object_count as u32);
     tree
 }

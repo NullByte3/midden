@@ -7,7 +7,7 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use super::dump::{
-    ArrayHashes, Buckets, Class, Dump, FastMap, Field, ObjectTable, RefKind, Slot, Static, Thread, Trace,
+    ArrayHashes, Class, Dump, FastMap, Field, ObjectTable, RefKind, Slot, Static, Thread, Trace,
 };
 use super::graph::{Graph, ReferencePolicy};
 use super::hash::{FNV_OFFSET_BASIS, FNV_PRIME};
@@ -248,8 +248,8 @@ pub fn save(path: &Path, key: &Key, dump: &Dump, graph: &Graph) -> io::Result<()
         writer.u64(class.instances)?;
         writer.u8(class.ref_kind.map_or(NO_REF_KIND, |kind| kind as u8))?;
     }
-    let (ids, shapes) = (dump.objects.ids(), dump.objects.shapes());
-    writer.u64s(ids.len(), ids.iter().copied())?;
+    let (objects, shapes) = (&dump.objects, dump.objects.shapes());
+    writer.u64s(objects.len(), (0..objects.len()).map(|object| objects.id(object)))?;
     writer.u64s(
         shapes.len(),
         shapes.iter().map(|&[low, high]| u64::from(low) | u64::from(high) << u32::BITS),
@@ -292,8 +292,9 @@ pub fn save(path: &Path, key: &Key, dump: &Dump, graph: &Graph) -> io::Result<()
     for value in [dump.class_class, dump.string_class, dump.value_label, dump.name_label] {
         writer.u32(value)?;
     }
-    let (offsets, targets, labels, weak) = graph.parts();
-    writer.u64s(offsets.len(), offsets.iter().copied())?;
+    let (targets, labels, weak) = graph.parts();
+    let offsets = graph.offsets();
+    writer.u64s(offsets.len(), offsets)?;
     writer.u32s(targets.len(), targets.iter().copied())?;
     writer.u32s(labels.len(), labels.iter().copied())?;
     writer.u32s(2 * weak.len(), weak.iter().flat_map(|&(referrer, referent)| [referrer, referent]))?;
@@ -461,8 +462,8 @@ fn read(mut reader: Reader, key: &Key, dump_path: &str) -> io::Result<(Dump, Gra
     if offsets.len() != count + 1 || targets.len() != labels.len() {
         return Err(invalid());
     }
-    let lookup = Buckets::build(&ids);
-    let objects = ObjectTable::from_columns(&classes, sizing, ids, shapes);
+    let objects = ObjectTable::from_columns(&classes, sizing, &ids, shapes);
+    drop(ids);
     let dump = Dump {
         path: dump_path.to_string(),
         file_size,
@@ -486,7 +487,6 @@ fn read(mut reader: Reader, key: &Key, dump_path: &str) -> io::Result<(Dump, Gra
         traces,
         frames,
         class_by_serial,
-        lookup,
         class_class,
         string_class,
         value_label,

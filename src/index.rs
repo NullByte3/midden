@@ -9,8 +9,8 @@ use std::sync::Arc;
 use super::analysis::duplicates::boxed_classes;
 use super::detail::ArrayHash;
 use super::dump::{
-    self, ArrayHashes, Buckets, Class, Dump, FastMap, Field, Kind, MAX_CLASS_DEPTH, MAX_CLASSES, NONE,
-    ObjectTable, RefKind, Slot, Static,
+    self, ArrayHashes, Class, Dump, FastMap, Field, Kind, MAX_CLASS_DEPTH, MAX_CLASSES, NONE, ObjectTable,
+    RefKind, Slot, Static,
 };
 use super::graph::LOADER;
 use super::hprof::{
@@ -555,6 +555,11 @@ impl Indexer {
         mode: SizeMode,
     ) -> Result<(Dump, Option<References>)> {
         self.resolve_class_dumps();
+        // Class and field names are copied out by now: only stack frames still look symbols up.
+        let framed: HashSet<u64> =
+            self.frames.values().flat_map(|frame| [frame.method_id, frame.source_id]).collect();
+        self.symbols.retain(|id, _| framed.contains(id));
+        self.symbols.shrink_to_fit();
         let value_label = intern_str(&mut self.names, "value");
         let name_label = intern_str(&mut self.names, "name");
 
@@ -564,7 +569,8 @@ impl Indexer {
         self.lay_out_classes(&sizing);
         // Starts are four bytes: a walk that copied more ids than that reads the references again.
         let keep = self.frozen && !self.late && self.references.len() < u32::MAX as usize;
-        let (objects, class_class, starts, array_hashes) = self.size_objects(sizing, keep);
+        let (mut objects, class_class, starts, array_hashes) = self.size_objects(sizing, keep);
+        objects.index();
         // u32 indices keep NONE free and the graph root one past the objects; labels stay below LOADER.
         let counts = [
             ("objects", objects.len(), NONE as usize - 1),
@@ -576,7 +582,6 @@ impl Indexer {
                 return Err(Error::Dump(format!("too many {what} for midden ({count}, limit {limit})")));
             }
         }
-        let lookup = Buckets::build(objects.ids());
         let string_class = class_named(&self.classes, "java.lang.String").unwrap_or(NONE);
         let references = keep.then(|| References {
             copied: std::mem::replace(&mut self.references, Copied::new(Column::with_capacity(0), 0)),
@@ -606,7 +611,6 @@ impl Indexer {
             traces: self.traces,
             frames: self.frames,
             class_by_serial: self.class_by_serial,
-            lookup,
             class_class,
             string_class,
             value_label,

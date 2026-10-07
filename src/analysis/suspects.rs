@@ -60,7 +60,7 @@ impl Heap<'_> {
         let mut current = top;
         for _ in 0..MAX_DESCENT {
             let Some(child) = self.dominators.biggest_child(current) else { break };
-            if self.dominators.retained[child as usize] * 4 < self.dominators.retained[current as usize] * 3 {
+            if self.dominators.retained(child) * 4 < self.dominators.retained(current) * 3 {
                 break;
             }
             let label = self.graph.label_of(current, child);
@@ -85,7 +85,7 @@ impl Heap<'_> {
         let mut out = Vec::new();
         let mut inside: FastMap<u32, u64> = FastMap::default();
         for &object in self.top_level() {
-            if self.dominators.retained[object as usize] < floor {
+            if self.dominators.retained(object) < floor {
                 break;
             }
             if self.excluded(self.class(object)) {

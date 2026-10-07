@@ -33,14 +33,56 @@ impl ReferencePolicy {
     }
 }
 
-/// Offsets, targets, labels and weak edges, as the cache stores them.
-pub type Parts<'a> = (&'a [u64], &'a [u32], &'a [u32], &'a [(u32, u32)]);
+/// Targets, labels and weak edges, as the cache stores them.
+pub type Parts<'a> = (&'a [u32], &'a [u32], &'a [(u32, u32)]);
+
+/// Objects per base in [`Offsets`].
+const OFFSET_BLOCK_BITS: u32 = 12;
+
+/// Where each object's edges start: four bytes each above a base every 4096 objects, or eight when a block
+/// holds 4G edges or more.
+struct Offsets {
+    low: Column<u32>,
+    bases: Vec<u64>,
+    wide: Option<Column<u64>>,
+}
+
+impl Offsets {
+    fn new(offsets: Column<u64>) -> Offsets {
+        let bases: Vec<u64> = offsets.iter().step_by(1 << OFFSET_BLOCK_BITS).copied().collect();
+        let fits = offsets
+            .iter()
+            .enumerate()
+            .all(|(i, &offset)| u32::try_from(offset - bases[i >> OFFSET_BLOCK_BITS]).is_ok());
+        if !fits {
+            return Offsets { low: Column::with_capacity(0), bases, wide: Some(offsets) };
+        }
+        let mut low = Column::<u32>::zeroed(offsets.len());
+        parallel::chunks(&mut low, |start, part| {
+            for (i, value) in (start..).zip(part.iter_mut()) {
+                *value = (offsets[i] - bases[i >> OFFSET_BLOCK_BITS]) as u32;
+            }
+        });
+        Offsets { low, bases, wide: None }
+    }
+
+    fn get(&self, i: usize) -> u64 {
+        match &self.wide {
+            Some(wide) => wide[i],
+            None => self.bases[i >> OFFSET_BLOCK_BITS] + u64::from(self.low[i]),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.wide.as_ref().map_or(self.low.len(), |wide| wide.len())
+    }
+}
 
 /// The object graph: out-edges per object, and the GC roots.
 pub struct Graph {
     /// The virtual root every GC root hangs off; equals the object count.
     pub root: u32,
-    offsets: Column<u64>,
+    offsets: Offsets,
     targets: Column<u32>,
     labels: Column<u32>,
     /// Referent edges left out of the graph proper, sorted by source.
@@ -84,7 +126,7 @@ impl<'a> Edges<'a> {
 impl Graph {
     /// Where `object`'s edges sit in [`Graph::all_targets`].
     pub fn span(&self, object: u32) -> std::ops::Range<usize> {
-        self.offsets[object as usize] as usize..self.offsets[object as usize + 1] as usize
+        self.offsets.get(object as usize) as usize..self.offsets.get(object as usize + 1) as usize
     }
 
     /// Every edge's target, object by object.
@@ -93,7 +135,8 @@ impl Graph {
     }
 
     pub fn edges(&self, object: u32) -> Edges<'_> {
-        let (lo, hi) = (self.offsets[object as usize] as usize, self.offsets[object as usize + 1] as usize);
+        let (lo, hi) =
+            (self.offsets.get(object as usize) as usize, self.offsets.get(object as usize + 1) as usize);
         Edges { targets: &self.targets[lo..hi], labels: &self.labels[lo..hi] }
     }
 
@@ -133,12 +176,25 @@ impl Graph {
         dangling: u64,
         roots: Vec<u32>,
     ) -> Graph {
-        Graph { root: offsets.len() as u32 - 1, offsets, targets, labels, weak, dangling, roots }
+        Graph {
+            root: offsets.len() as u32 - 1,
+            offsets: Offsets::new(offsets),
+            targets,
+            labels,
+            weak,
+            dangling,
+            roots,
+        }
     }
 
     /// The parts the cache writes.
     pub fn parts(&self) -> Parts<'_> {
-        (&self.offsets, &self.targets, &self.labels, &self.weak)
+        (&self.targets, &self.labels, &self.weak)
+    }
+
+    /// Where each object's edges start, then the total, as the cache stores them.
+    pub fn offsets(&self) -> impl ExactSizeIterator<Item = u64> + '_ {
+        (0..self.offsets.len()).map(|i| self.offsets.get(i))
     }
 }
 
@@ -251,6 +307,7 @@ pub fn build(
     if !holes {
         let (mut targets, labels) = (target_column, label_column);
         parallel::chunks(&mut targets, |_, part| part.iter_mut().for_each(|target| *target -= 1));
+        let offsets = Offsets::new(offsets);
         return Ok(Graph { root: object_count as u32, offsets, targets, labels, weak, dangling, roots });
     }
 
@@ -288,7 +345,9 @@ pub fn build(
     labels.truncate(dst);
     targets.shrink_to_fit();
     labels.shrink_to_fit();
-    Ok(Graph { root: object_count as u32, offsets: packed, targets, labels, weak, dangling, roots })
+    drop(offsets);
+    let offsets = Offsets::new(packed);
+    Ok(Graph { root: object_count as u32, offsets, targets, labels, weak, dangling, roots })
 }
 
 /// Turn the copied ids into edges, a range of objects per worker, packed as counted. The same rules as
@@ -370,13 +429,9 @@ struct Filler<'a> {
 
 impl Filler<'_> {
     fn index_of(&mut self, id: u64) -> Option<u32> {
-        let near = self
-            .dump
-            .objects
-            .ids()
-            .get(self.next..)
-            .and_then(|rest| rest.iter().take(2).position(|&next| next == id));
-        let idx = near.map(|ahead| (self.next + ahead) as u32).or_else(|| self.dump.lookup(id));
+        let objects = &self.dump.objects;
+        let near = (self.next..objects.len().min(self.next + 2)).find(|&next| objects.id(next) == id);
+        let idx = near.map(|next| next as u32).or_else(|| self.dump.lookup(id));
         if let Some(i) = idx {
             self.next = i as usize + 1;
         }

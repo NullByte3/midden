@@ -137,6 +137,7 @@ impl<'a> Heap<'a> {
             }),
         };
         heap.dominators = dominators;
+        heap.reachability.keep_differing(&heap.dominators.idom);
         (heap, during)
     }
 
@@ -198,7 +199,7 @@ impl<'a> Heap<'a> {
     }
 
     pub fn retained(&self, object: u32) -> u64 {
-        self.dominators.retained[object as usize]
+        self.dominators.retained(object)
     }
 
     pub fn shallow(&self, object: u32) -> u64 {
@@ -206,7 +207,7 @@ impl<'a> Heap<'a> {
     }
 
     pub fn reachable(&self, object: u32) -> bool {
-        self.reachability.parent[object as usize] != NONE
+        self.reachability.reached(object, &self.dominators.idom)
     }
 
     /// Alive only through soft, weak or phantom references.
@@ -271,7 +272,7 @@ impl<'a> Heap<'a> {
                 let object = tree.preorder[pos];
                 let group = group_of(object);
                 if !inside[group as usize] {
-                    retained[group as usize] += tree.retained[object as usize];
+                    retained[group as usize] += tree.retained(object);
                     inside[group as usize] = true;
                     open.push((tree.subtree_end[pos], group));
                 }
@@ -435,7 +436,7 @@ impl<'a> Heap<'a> {
                 for &object in &current[lo..hi] {
                     let dominator = self.dominators.idom[object as usize];
                     let class = if dominator == root { NONE } else { self.class(dominator) };
-                    *bytes.entry(class).or_default() += self.dominators.retained[object as usize];
+                    *bytes.entry(class).or_default() += self.dominators.retained(object);
                 }
                 bytes
             });
@@ -469,12 +470,12 @@ impl<'a> Heap<'a> {
 
     /// Root-to-object path with the label of the edge into each hop.
     pub fn root_path(&self, object: u32) -> Vec<(u32, Option<u32>)> {
-        self.labelled(&self.reachability.path(self.graph.root, object))
+        self.labelled(&self.reachability.path(self.graph.root, object, &self.dominators.idom))
     }
 
     /// Up to `limit` root paths arriving through different referrers.
     pub fn root_paths(&self, object: u32, limit: usize) -> Vec<Vec<(u32, Option<u32>)>> {
-        dom::paths(self.graph, self.dump, &self.reachability, object, limit)
+        dom::paths(self.graph, self.dump, (&self.reachability, &self.dominators.idom), object, limit)
             .into_iter()
             .map(|path| self.labelled(&path))
             .collect()
@@ -616,7 +617,7 @@ impl<'a> Heap<'a> {
         let parts = parallel::ranges(self.dump.objects.len(), |lo, hi| {
             let mut best = vec![(0u64, NONE); n];
             for object in lo as u32..hi as u32 {
-                let retained = self.dominators.retained[object as usize];
+                let retained = self.dominators.retained(object);
                 let class = self.class(object) as usize;
                 if self.reachable(object) && retained > best[class].0 {
                     best[class] = (retained, object);
