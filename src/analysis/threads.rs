@@ -54,7 +54,7 @@ impl Heap<'_> {
                     .filter(|(_, root)| {
                         root.thread_serial == thread.serial && stack_kinds.contains(&root.kind)
                     })
-                    .filter(|(object, _)| dump.objects[*object as usize].kind != Kind::Class)
+                    .filter(|(object, _)| dump.objects.kind(*object as usize) != Kind::Class)
                     .map(|(object, root)| StackLocal { object: *object, frame: root.frame, kind: root.kind })
                     .collect();
                 locals.sort_by(|a, b| {

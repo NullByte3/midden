@@ -104,7 +104,7 @@ impl Heap<'_> {
         parallel::ranges(dump.objects.len(), |lo, hi| {
             (lo as u32..hi as u32)
                 .filter(|&object| {
-                    let record = &dump.objects[object as usize];
+                    let record = dump.objects.get(object as usize);
                     record.kind == Kind::PrimitiveArray
                         && record.shallow >= dump.sizing.array_header + MIN_ARRAY_DATA_BYTES
                 })

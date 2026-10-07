@@ -1,8 +1,13 @@
 //! Thread fan-out over `--threads` scoped workers. Nothing is shared mutably: each worker returns its
 //! part and the caller merges.
 
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::{Condvar, Mutex};
 use std::thread;
+
+use zerocopy::FromZeros;
+
+use super::store::Column;
 
 /// Workers when the core count is unknown, and before `--threads` is applied.
 pub const DEFAULT_THREADS: usize = 4;
@@ -15,12 +20,6 @@ pub fn set_threads(count: usize) {
 
 pub fn threads() -> usize {
     THREADS.load(Relaxed)
-}
-
-/// `len` atomics at zero, on pages nothing has touched yet: the workers that
-/// fill them take the page faults, not the thread that allocates.
-pub fn zeroed(len: usize) -> Vec<AtomicU32> {
-    vec![0u32; len].into_iter().map(AtomicU32::new).collect()
 }
 
 /// Split `0..len` into one range per worker and run `f` on each, in order.
@@ -69,4 +68,98 @@ fn run<'env, T: Send + 'env>(tasks: impl Iterator<Item = impl FnOnce() -> T + Se
         let handles: Vec<_> = tasks.map(|task| scope.spawn(task)).collect();
         handles.into_iter().map(|handle| handle.join().expect("worker panicked")).collect()
     })
+}
+
+/// Run `work` over every item on the workers and hand the results to `consume` in item order, on the
+/// calling thread, as each one and all before it are done. Workers stay a few items ahead, so only that
+/// many results are held at once. `consume` returning false stops the rest.
+pub fn ordered<I: Sync, T: Send>(
+    items: &[I],
+    work: impl Fn(&I) -> T + Sync,
+    mut consume: impl FnMut(T) -> bool,
+) {
+    let workers = threads().min(items.len().max(1));
+    if workers <= 1 {
+        for item in items {
+            if !consume(work(item)) {
+                return;
+            }
+        }
+        return;
+    }
+    let window = 2 * workers;
+    let state = Mutex::new(Ordered {
+        next: 0,
+        consumed: 0,
+        stop: false,
+        ready: (0..items.len()).map(|_| None).collect(),
+    });
+    let (done, room) = (Condvar::new(), Condvar::new());
+    thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    let i = {
+                        let mut state = state.lock().expect("worker panicked");
+                        while !state.stop && state.next < items.len() && state.next >= state.consumed + window
+                        {
+                            state = room.wait(state).expect("worker panicked");
+                        }
+                        if state.stop || state.next >= items.len() {
+                            return;
+                        }
+                        state.next += 1;
+                        state.next - 1
+                    };
+                    let result = work(&items[i]);
+                    state.lock().expect("worker panicked").ready[i] = Some(result);
+                    done.notify_all();
+                }
+            });
+        }
+        for i in 0..items.len() {
+            let result = {
+                let mut state = state.lock().expect("worker panicked");
+                loop {
+                    if let Some(result) = state.ready[i].take() {
+                        state.consumed = i + 1;
+                        break result;
+                    }
+                    state = done.wait(state).expect("worker panicked");
+                }
+            };
+            room.notify_all();
+            if !consume(result) {
+                state.lock().expect("worker panicked").stop = true;
+                room.notify_all();
+                return;
+            }
+        }
+    });
+}
+
+/// Shared by the workers of [`ordered`]: the next item to claim, how many were consumed, the results.
+struct Ordered<T> {
+    next: usize,
+    consumed: usize,
+    stop: bool,
+    ready: Vec<Option<T>>,
+}
+
+/// `len` copies of `value` in a column, filled by the workers.
+pub fn filled<T: FromZeros + Copy + Send + Sync>(len: usize, value: T) -> Column<T> {
+    let mut column = Column::zeroed(len);
+    chunks(&mut column, |_, part| part.fill(value));
+    column
+}
+
+/// `0..len` in a column.
+pub fn iota(len: usize) -> Column<u32> {
+    let mut column = Column::zeroed(len);
+    chunks(&mut column, |start, part| {
+        for (value, i) in part.iter_mut().zip(start as u32..) {
+            *value = i;
+        }
+    });
+    column
 }

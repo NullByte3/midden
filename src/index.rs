@@ -1,24 +1,52 @@
-//! Pass one: everything but the references. Symbols, classes and their
-//! layouts, the object table with shallow sizes, GC roots and thread stacks.
+//! Pass one: everything in one read of the heap. Symbols, classes and their layouts, the object table
+//! with shallow sizes, GC roots and thread stacks, and each object's references as raw ids for the graph.
 
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::io;
 use std::sync::Arc;
 
 use super::dump::{
-    self, Buckets, Class, Dump, FastMap, Field, Kind, MAX_CLASS_DEPTH, NONE, Object, RefKind, Slot, Static,
+    self, Buckets, Class, Dump, FastMap, Field, Kind, MAX_CLASS_DEPTH, MAX_CLASSES, NONE, ObjectTable,
+    RefKind, Slot, Static,
 };
 use super::graph::LOADER;
-use super::hprof::{self, Body, ClassDump, Frame, Header, Reader, Root, RootKind, Sink, Ty, View, Walked};
+use super::hprof::{
+    self, Body, ClassDump, Frame, Header, IO_BUFFER_SIZE, Reader, Root, RootKind, Sink, Ty, View, Walked,
+    be_uint,
+};
 use super::parallel;
 use super::sizes::{SizeMode, Sizing};
 use super::source::Progress;
+use super::store::Column;
 use crate::error::{Error, Result};
+
+/// An object as the walk meets it: id, then class and kind above the length, then where its
+/// references start in the copied ids (`raw`).
+type Raw = [u64; 3];
+
+fn raw(id: u64, class: u32, kind: Kind, len: u32, references: usize) -> Raw {
+    [id, u64::from(class) << 34 | (kind as u64) << 32 | u64::from(len), references as u64]
+}
+
+fn raw_class(record: Raw) -> u32 {
+    (record[1] >> 34) as u32
+}
+
+fn raw_kind(record: Raw) -> Kind {
+    Kind::ALL[(record[1] >> 32 & 3) as usize]
+}
 
 /// Primitive array classes by `Ty as usize`; room for every HPROF basic-type tag (long, the largest, is 11).
 const BASIC_TYPE_SLOTS: usize = 12;
 
-#[derive(Default)]
+/// Every object's reference slots as the walk copied them, ids with zero for null, and where each
+/// object's start, by object index. The graph resolves them without reading the dump again.
+pub struct References {
+    pub ids: Column<u64>,
+    pub starts: Column<u64>,
+}
+
 pub struct Indexer {
     id_size: u32,
     symbols: FastMap<u64, String>,
@@ -26,7 +54,16 @@ pub struct Indexer {
     class_by_id: FastMap<u64, u32>,
     class_by_serial: HashMap<u32, u32>,
     class_dumps: Vec<ClassDump>,
-    objects: Vec<Object>,
+    /// Field names, interned by text: one `value` label whatever symbol ids the file used.
+    names: Vec<String>,
+    name_by_text: HashMap<String, u32>,
+    name_by_id: FastMap<u64, u32>,
+    objects: Column<Raw>,
+    references: Column<u64>,
+    /// Layouts are fixed and the walk copies references from here on.
+    frozen: bool,
+    /// A class dump came after the layouts were fixed: the references are read in a second pass.
+    late: bool,
     roots: Vec<Root>,
     traces: HashMap<u32, dump::Trace>,
     frames: FastMap<u64, Frame>,
@@ -38,9 +75,23 @@ impl Indexer {
     pub fn new(id_size: u32) -> Indexer {
         Indexer {
             id_size,
+            symbols: FastMap::default(),
+            classes: Vec::new(),
+            class_by_id: FastMap::default(),
+            class_by_serial: HashMap::new(),
+            class_dumps: Vec::new(),
+            names: Vec::new(),
+            name_by_text: HashMap::new(),
+            name_by_id: FastMap::default(),
+            objects: Column::with_capacity(0),
+            references: Column::with_capacity(0),
+            frozen: false,
+            late: false,
+            roots: Vec::new(),
+            traces: HashMap::new(),
+            frames: FastMap::default(),
             prim_array_classes: [NONE; BASIC_TYPE_SLOTS],
             last_class: (0, NONE),
-            ..Indexer::default()
         }
     }
 
@@ -72,6 +123,51 @@ impl Indexer {
         }
         self.prim_array_classes[ty_idx]
     }
+
+    /// Fix the layouts once the class dumps before the first object are in (`HotSpot` writes them all
+    /// first), so the walk can copy references as it goes. A dump naming a class the file never loaded
+    /// would mint placeholders out of their usual order, so then the references wait for a second pass.
+    fn freeze(&mut self) {
+        self.frozen = true;
+        let known = |id: u64| id == 0 || self.class_by_id.contains_key(&id);
+        if !self.class_dumps.iter().all(|class_dump| known(class_dump.id) && known(class_dump.super_id)) {
+            self.late = true;
+            return;
+        }
+        self.resolve_class_dumps();
+        // Reference slots do not depend on the size convention; `finish` lays out again with the real one.
+        self.lay_out_classes(&Sizing::resolve(SizeMode::Mat, self.id_size, 0));
+    }
+
+    /// Whether the walk copies references: the layouts are fixed and no class dump came after them.
+    fn copies(&mut self) -> bool {
+        if !self.frozen {
+            self.freeze();
+        }
+        !self.late
+    }
+}
+
+/// Copy an instance's reference slots from its body: an id each, zero for null or past a short body.
+fn copy_slots(slots: &[Slot], id_size: usize, body: Body, out: &mut impl Extend<u64>) -> io::Result<()> {
+    if slots.is_empty() {
+        return Ok(());
+    }
+    let bytes = body.bytes()?;
+    out.extend(
+        slots
+            .iter()
+            .map(|slot| bytes.get(slot.offset as usize..slot.offset as usize + id_size).map_or(0, be_uint)),
+    );
+    Ok(())
+}
+
+/// Copy an object array's elements: an id each, zero for null.
+fn copy_elements(id_size: usize, body: Body, out: &mut impl Extend<u64>) -> io::Result<()> {
+    body.chunks(IO_BUFFER_SIZE, |chunk| {
+        out.extend(chunk.chunks_exact(id_size).map(be_uint));
+        Ok(())
+    })
 }
 
 /// The object callbacks: the same code for the sequential walk and a worker's part.
@@ -79,19 +175,32 @@ macro_rules! object_callbacks {
     () => {
         fn instance(&mut self, id: u64, class_id: u64, body: Body) -> io::Result<()> {
             let class = self.class_index(class_id);
-            self.objects.push(Object { id, class, len: body.len() as u32, shallow: 0, kind: Kind::Instance });
+            let (len, start) = (body.len() as u32, self.references.len());
+            if self.copies() && class != NONE {
+                copy_slots(
+                    &self.classes[class as usize].slots,
+                    self.id_size as usize,
+                    body,
+                    &mut self.references,
+                )?;
+            }
+            self.objects.push(raw(id, class, Kind::Instance, len, start));
             Ok(())
         }
 
-        fn object_array(&mut self, id: u64, class_id: u64, len: u32, _body: Body) -> io::Result<()> {
+        fn object_array(&mut self, id: u64, class_id: u64, len: u32, body: Body) -> io::Result<()> {
             let class = self.class_index(class_id);
-            self.objects.push(Object { id, class, len, shallow: 0, kind: Kind::ObjectArray });
+            let start = self.references.len();
+            if self.copies() {
+                copy_elements(self.id_size as usize, body, &mut self.references)?;
+            }
+            self.objects.push(raw(id, class, Kind::ObjectArray, len, start));
             Ok(())
         }
 
         fn primitive_array(&mut self, id: u64, ty: Ty, len: u32, _body: Body) -> io::Result<()> {
             let class = self.primitive_array_class(ty);
-            self.objects.push(Object { id, class, len, shallow: 0, kind: Kind::PrimitiveArray });
+            self.objects.push(raw(id, class, Kind::PrimitiveArray, len, 0));
             Ok(())
         }
     };
@@ -132,6 +241,7 @@ impl Sink for Indexer {
     }
 
     fn class(&mut self, class: ClassDump) {
+        self.late |= self.frozen;
         self.class_index(class.id);
         self.class_dumps.push(class);
     }
@@ -142,11 +252,16 @@ impl Sink for Indexer {
 /// One run of heap segments, read on a worker. A class whose load record is not seen yet is left
 /// to the sequential walk, which mints placeholders in file order.
 struct Part<'a> {
+    id_size: u32,
     class_by_id: &'a FastMap<u64, u32>,
+    classes: &'a [Class],
     prim_array_classes: [u32; BASIC_TYPE_SLOTS],
     missed: bool,
+    /// Copy references: false once a class dump turned up after the layouts were fixed.
+    copying: bool,
     class_dumps: Vec<ClassDump>,
-    objects: Vec<Object>,
+    objects: Vec<Raw>,
+    references: Vec<u64>,
     roots: Vec<Root>,
 }
 
@@ -162,6 +277,10 @@ impl Part<'_> {
         self.missed |= class == NONE;
         class
     }
+
+    fn copies(&self) -> bool {
+        self.copying
+    }
 }
 
 impl Sink for Part<'_> {
@@ -170,16 +289,28 @@ impl Sink for Part<'_> {
     }
 
     fn class(&mut self, class: ClassDump) {
+        self.copying = false;
         self.class_dumps.push(class);
     }
 
     object_callbacks!();
 }
 
+/// What a worker's part brought back.
+struct Parsed {
+    class_dumps: Vec<ClassDump>,
+    objects: Vec<Raw>,
+    references: Vec<u64>,
+    copied: bool,
+    roots: Vec<Root>,
+    walked: Walked,
+}
+
 impl Indexer {
     /// Read the stepped-over segments, a run of adjacent ones per worker, merged in file order. False
     /// sends the file back to the sequential walk: segments were also walked in place, one runs past
-    /// the end, a part fails to parse, or a class needs a placeholder only file order can mint.
+    /// the end, a part fails to parse, or a class needs a placeholder only file order can mint. The
+    /// class dumps and roots before the first object are read first, here, to fix the layouts.
     pub fn read_segments(&mut self, view: &View, walked: &mut Walked, progress: &Arc<Progress>) -> bool {
         let segments = std::mem::take(&mut walked.segments);
         if !walked.chunks.is_empty() || segments.last().is_some_and(|&(_, end)| end > view.len) {
@@ -197,43 +328,82 @@ impl Indexer {
                 _ => runs.push((start, end)),
             }
         }
+        let Some(first) = runs.first_mut() else { return true };
+        let objects_start = Reader::open_at(view, first.0, self.id_size)
+            .and_then(|mut reader| hprof::prelude(&mut reader, first.1, self));
+        let Ok(objects_start) = objects_start else { return false };
+        first.0 = objects_start;
+        runs.retain(|&(start, end)| start < end);
+        self.freeze();
         let mut prim_array_classes = [NONE; BASIC_TYPE_SLOTS];
         for ty in [Ty::Bool, Ty::Char, Ty::Float, Ty::Double, Ty::Byte, Ty::Short, Ty::Int, Ty::Long] {
             let name = format!("{}[]", ty.name());
             prim_array_classes[ty as usize] = class_named(&self.classes, &name).unwrap_or(NONE);
         }
         progress.begin("indexing objects", runs.iter().map(|&(start, end)| end - start).sum());
-        let (id_size, class_by_id) = (self.id_size, &self.class_by_id);
-        let parts = parallel::items(&runs, |&(start, end)| {
-            let mut reader = Reader::open_at(view, start, id_size).ok()?;
-            reader.progress = progress.counter(start);
-            let mut part = Part {
-                class_by_id,
-                prim_array_classes,
-                missed: false,
-                class_dumps: Vec::new(),
-                objects: Vec::new(),
-                roots: Vec::new(),
-            };
-            let mut part_walked = Walked::default();
-            hprof::heap(&mut reader, Some(end), &mut part, &mut part_walked).ok()?;
-            (!part.missed).then_some((part.class_dumps, part.objects, part.roots, part_walked))
-        });
-        let Some(parts) = parts.into_iter().collect::<Option<Vec<_>>>() else { return false };
-        self.objects.reserve(parts.iter().map(|(_, objects, _, _)| objects.len()).sum());
-        for (class_dumps, objects, roots, part_walked) in parts {
-            for class_dump in class_dumps {
-                self.class(class_dump);
-            }
-            self.objects.extend(objects);
-            self.roots.extend(roots);
-            walked.chunks.extend(part_walked.chunks);
-            walked.pieces.extend(part_walked.pieces);
+        let (id_size, class_by_id, classes, copying) =
+            (self.id_size, &self.class_by_id, &self.classes, !self.late);
+        let (mut complete, mut class_dumps) = (true, Vec::new());
+        parallel::ordered(
+            &runs,
+            |&(start, end)| {
+                let mut reader = Reader::open_at(view, start, id_size).ok()?;
+                reader.progress = progress.counter(start);
+                let mut part = Part {
+                    id_size,
+                    class_by_id,
+                    classes,
+                    prim_array_classes,
+                    missed: false,
+                    copying,
+                    class_dumps: Vec::new(),
+                    objects: Vec::new(),
+                    references: Vec::new(),
+                    roots: Vec::new(),
+                };
+                let mut part_walked = Walked::default();
+                hprof::heap(&mut reader, Some(end), &mut part, &mut part_walked).ok()?;
+                (!part.missed).then_some(Parsed {
+                    class_dumps: part.class_dumps,
+                    objects: part.objects,
+                    references: part.references,
+                    copied: part.copying,
+                    roots: part.roots,
+                    walked: part_walked,
+                })
+            },
+            |part| {
+                let Some(part) = part else {
+                    complete = false;
+                    return false;
+                };
+                class_dumps.extend(part.class_dumps);
+                self.late |= !part.copied;
+                if self.late {
+                    self.objects.extend_from_slice(&part.objects);
+                } else {
+                    let base = self.references.len() as u64;
+                    self.references.extend_from_slice(&part.references);
+                    self.objects.reserve(part.objects.len());
+                    for &[id, shape, start] in &part.objects {
+                        self.objects.push([id, shape, start + base]);
+                    }
+                }
+                self.roots.extend(part.roots);
+                walked.chunks.extend(part.walked.chunks);
+                walked.pieces.extend(part.walked.pieces);
+                true
+            },
+        );
+        // Class dumps can mint placeholders, which the workers must not see change.
+        for class_dump in class_dumps {
+            self.class(class_dump);
         }
-        true
+        complete
     }
 
-    /// Resolve layouts, size every object, sort the table, resolve the roots.
+    /// Resolve layouts, size every object, sort the table, resolve the roots. Also hands back the
+    /// references the walk copied, unless a late class dump means the graph must read them itself.
     pub fn finish(
         mut self,
         path: &str,
@@ -241,29 +411,34 @@ impl Indexer {
         header: Header,
         walked: Walked,
         mode: SizeMode,
-    ) -> Result<Dump> {
-        let mut names = self.resolve_class_dumps();
-        let value_label = intern_str(&mut names, "value");
-        let name_label = intern_str(&mut names, "name");
+    ) -> Result<(Dump, Option<References>)> {
+        self.resolve_class_dumps();
+        let value_label = intern_str(&mut self.names, "value");
+        let name_label = intern_str(&mut self.names, "name");
 
         // Sizes depend on the address range.
-        let max_id = self.objects.iter().map(|object| object.id).max().unwrap_or(0);
+        let max_id = self.objects.iter().map(|record| record[0]).max().unwrap_or(0);
         let sizing = Sizing::resolve(mode, self.id_size, max_id);
-        self.lay_out_classes(&sizing, &names);
-        let class_class = self.size_objects(&sizing);
+        self.lay_out_classes(&sizing);
+        let keep = self.frozen && !self.late;
+        let (objects, class_class, starts) = self.size_objects(sizing, keep);
         // u32 indices keep NONE free and the graph root one past the objects; labels stay below LOADER.
         let counts = [
-            ("objects", self.objects.len(), NONE - 1),
-            ("classes", self.classes.len(), NONE),
-            ("field names", names.len(), LOADER),
+            ("objects", objects.len(), NONE as usize - 1),
+            ("classes", self.classes.len(), MAX_CLASSES - 1),
+            ("field names", self.names.len(), LOADER as usize),
         ];
         for (what, count, limit) in counts {
-            if count > limit as usize {
+            if count > limit {
                 return Err(Error::Dump(format!("too many {what} for midden ({count}, limit {limit})")));
             }
         }
-        let lookup = Buckets::build(&self.objects);
+        let lookup = Buckets::build(objects.ids());
         let string_class = class_named(&self.classes, "java.lang.String").unwrap_or(NONE);
+        let references = keep.then(|| References {
+            ids: std::mem::replace(&mut self.references, Column::with_capacity(0)),
+            starts,
+        });
 
         let mut dump = Dump {
             path: path.to_string(),
@@ -275,10 +450,10 @@ impl Indexer {
             sizing,
             chunks: walked.chunks,
             pieces: walked.pieces,
-            names,
+            names: self.names,
             symbols: self.symbols,
             classes: self.classes,
-            objects: self.objects,
+            objects,
             roots: Vec::new(),
             dangling_roots: 0,
             marked_unreachable: 0,
@@ -293,46 +468,54 @@ impl Indexer {
             name_label,
         };
         resolve_roots(&mut dump, self.roots);
-        Ok(dump)
+        Ok((dump, references))
     }
 
-    /// Apply the class dumps to their classes, returning the interned field names.
-    fn resolve_class_dumps(&mut self) -> Vec<String> {
-        // Names are interned by text: one `value` label whatever symbol ids the file used.
-        let mut names: Vec<String> = Vec::new();
-        let mut name_by_text: HashMap<String, u32> = HashMap::new();
-        let mut name_by_id: FastMap<u64, u32> = FastMap::default();
-        let mut intern = |id: u64, symbols: &FastMap<u64, String>| -> u32 {
-            *name_by_id.entry(id).or_insert_with(|| {
-                let text = symbols.get(&id).cloned().unwrap_or_else(|| format!("<0x{id:x}>"));
-                *name_by_text.entry(text.clone()).or_insert_with(|| push(&mut names, text))
-            })
-        };
+    /// Apply the class dumps read so far to their classes, interning their field names.
+    fn resolve_class_dumps(&mut self) {
         for class_dump in std::mem::take(&mut self.class_dumps) {
             let idx = self.class_index(class_dump.id) as usize;
             let superclass =
                 if class_dump.super_id == 0 { NONE } else { self.class_index(class_dump.super_id) };
+            let fields = class_dump
+                .fields
+                .iter()
+                .map(|&(name_id, ty)| Field { name: self.intern(name_id), ty })
+                .collect();
+            let statics = class_dump
+                .statics
+                .iter()
+                .map(|&(name_id, ty, value)| Static { name: self.intern(name_id), ty, value })
+                .collect();
             let class = &mut self.classes[idx];
             class.superclass = superclass;
             class.loader = class_dump.loader_id;
             class.dumped = true;
-            class.fields = class_dump
-                .fields
-                .iter()
-                .map(|&(name_id, ty)| Field { name: intern(name_id, &self.symbols), ty })
-                .collect();
-            class.statics = class_dump
-                .statics
-                .iter()
-                .map(|&(name_id, ty, value)| Static { name: intern(name_id, &self.symbols), ty, value })
-                .collect();
+            class.fields = fields;
+            class.statics = statics;
         }
-        names
     }
 
-    fn lay_out_classes(&mut self, sizing: &Sizing, names: &[String]) {
+    /// The label for a field name symbol.
+    fn intern(&mut self, id: u64) -> u32 {
+        if let Some(&label) = self.name_by_id.get(&id) {
+            return label;
+        }
+        let text = self.symbols.get(&id).cloned().unwrap_or_else(|| format!("<0x{id:x}>"));
+        let label = if let Some(&label) = self.name_by_text.get(&text) {
+            label
+        } else {
+            let label = push(&mut self.names, text.clone());
+            self.name_by_text.insert(text, label);
+            label
+        };
+        self.name_by_id.insert(id, label);
+        label
+    }
+
+    fn lay_out_classes(&mut self, sizing: &Sizing) {
         let reference = class_named(&self.classes, "java.lang.ref.Reference");
-        let referent = names.iter().position(|name| name == "referent").map(|i| i as u32);
+        let referent = self.names.iter().position(|name| name == "referent").map(|i| i as u32);
         let class_count = self.classes.len();
         let mut laid_out = vec![false; class_count];
         for i in 0..class_count {
@@ -341,39 +524,80 @@ impl Indexer {
         mark_reference_kinds(&mut self.classes);
     }
 
-    /// Add the class objects, sort the table, size every object and count instances.
-    /// Returns the `java.lang.Class` class.
-    fn size_objects(&mut self, sizing: &Sizing) -> u32 {
+    /// The object table: the walk's records and the class objects merged by id, one of each id kept,
+    /// instances counted. Also returns the `java.lang.Class` class and, when `keep`, where each kept
+    /// object's copied references start.
+    fn size_objects(&mut self, sizing: Sizing, keep: bool) -> (ObjectTable, u32, Column<u64>) {
         // Class objects live in the object table too: statics are edges and
         // sticky-class roots point at them.
         let class_class = class_named(&self.classes, "java.lang.Class")
             .unwrap_or_else(|| push(&mut self.classes, Class::placeholder("java.lang.Class".to_string(), 0)));
+        let mut class_objects: Vec<Raw> = Vec::new();
         for class in self.classes.iter().filter(|class| class.dumped) {
             let statics_size: u64 =
                 class.statics.iter().map(|field| u64::from(sizing.field_size(field.ty))).sum();
-            let (id, shallow) = (class.id, sizing.instance_size(statics_size));
-            self.objects.push(Object { id, class: class_class, len: 0, shallow, kind: Kind::Class });
+            class_objects.push(raw(
+                class.id,
+                class_class,
+                Kind::Class,
+                sizing.instance_size(statics_size),
+                0,
+            ));
         }
-        // One sort by id, dropping duplicates. HotSpot writes by address in runs, so the stable sort is
-        // nearly free.
-        self.objects.sort_by_key(|object| object.id);
-        self.objects.dedup_by_key(|object| object.id);
-        for object in &mut self.objects {
-            let class = &self.classes[object.class as usize];
-            object.shallow = match object.kind {
-                Kind::Instance => class.shallow,
-                Kind::ObjectArray => sizing.array_size(u64::from(object.len), sizing.ref_size),
-                Kind::PrimitiveArray => sizing.array_size(
-                    u64::from(object.len),
-                    class.element_type.map_or(1, |ty| sizing.field_size(ty)),
-                ),
-                Kind::Class => object.shallow,
-            };
+        class_objects.sort_by_key(|record| record[0]);
+        let records = std::mem::replace(&mut self.objects, Column::with_capacity(0));
+        // HotSpot writes by address in runs: merge the runs, earlier ones first on equal ids, which is
+        // a stable sort. The first record of each id is kept.
+        let mut runs: Vec<&[Raw]> = Vec::new();
+        let mut start = 0;
+        for i in 1..=records.len() {
+            if i == records.len() || records[i][0] < records[i - 1][0] {
+                runs.push(&records[start..i]);
+                start = i;
+            }
         }
-        for object in &self.objects {
-            self.classes[object.class as usize].instances += 1;
+        runs.push(&class_objects);
+        runs.retain(|run| !run.is_empty());
+        let capacity = records.len() + class_objects.len();
+        let mut table = ObjectTable::new(&self.classes, sizing, capacity);
+        let mut starts = Column::with_capacity(if keep { capacity } else { 0 });
+        let mut last = None;
+        let mut instances = vec![0u64; self.classes.len()];
+        merge_runs(&mut runs, |record| {
+            if last != Some(record[0]) {
+                last = Some(record[0]);
+                let class = raw_class(record);
+                instances[class as usize] += 1;
+                table.push(record[0], class, raw_kind(record), record[1] as u32);
+                if keep {
+                    starts.push(record[2]);
+                }
+            }
+        });
+        for (class, count) in self.classes.iter_mut().zip(instances) {
+            class.instances = count;
         }
-        class_class
+        (table, class_class, starts)
+    }
+}
+
+/// Feed the records of sorted runs to `emit` in id order, an earlier run first on equal ids. Emits a
+/// stretch of the run with the smallest head at once, up to the next head.
+fn merge_runs(runs: &mut [&[Raw]], mut emit: impl FnMut(Raw)) {
+    let head = |runs: &[&[Raw]], run: usize| runs[run].first().map(|record| Reverse((record[0], run)));
+    let mut heads: BinaryHeap<Reverse<(u64, usize)>> =
+        (0..runs.len()).filter_map(|run| head(runs, run)).collect();
+    while let Some(Reverse((_, run))) = heads.pop() {
+        let stretch = match heads.peek() {
+            None => runs[run].len(),
+            Some(&Reverse(next)) => runs[run].partition_point(|record| (record[0], run) < next).max(1),
+        };
+        let (taken, rest) = runs[run].split_at(stretch);
+        for &record in taken {
+            emit(record);
+        }
+        runs[run] = rest;
+        heads.extend(head(runs, run));
     }
 }
 

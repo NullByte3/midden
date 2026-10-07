@@ -20,6 +20,7 @@ mod report;
 mod shell;
 mod sizes;
 mod source;
+mod store;
 mod strings;
 
 pub use options::Sort;
@@ -73,8 +74,7 @@ fn run(args: &Args) -> Result<()> {
 
     // Baseline first, so only its snapshot outlives the load.
     let baseline = match &args.baseline {
-        Some(path) => analyse(load(path, &opts)?, view.clone(), |mut session| {
-            session.prepare()?;
+        Some(path) => analyse(load(path, &opts)?, view.clone(), |session| {
             let histogram = session.heap.histogram();
             Ok(Some(session.heap.snapshot(&histogram, session.inputs.duplicates.as_ref())))
         })?,
@@ -84,7 +84,6 @@ fn run(args: &Args) -> Result<()> {
     analyse(load(&args.file, &opts)?, view, |mut session| {
         (session.json, session.color) = (args.json, use_color(args.color));
         session.inputs.baseline = baseline;
-        session.prepare()?;
         progress.end();
         let out = session.show(&session.view.clone())?;
         print!("{out}");
@@ -96,13 +95,21 @@ fn run(args: &Args) -> Result<()> {
     })
 }
 
-/// Build the heap of a load and hand its session to `then`. The cache write only reads the index, so it
-/// runs beside the analysis.
+/// Build the heap of a load, read its details and hand its session to `then`. The cache write only reads
+/// the index, so it runs beside the analysis; the detail read runs beside the dominator tree.
 fn analyse<T>(loaded: Loaded, view: View, then: impl FnOnce(Session) -> Result<T>) -> Result<T> {
     thread::scope(|scope| {
         scope.spawn(|| save(&loaded.dump, &loaded.graph, loaded.index.as_ref()));
-        loaded.source.progress.stage("computing dominators");
-        then(Session::new(Heap::new(&loaded.dump, &loaded.graph), loaded.source, view))
+        let progress = &loaded.source.progress;
+        progress.stage("computing dominators");
+        let (heap, details) = Heap::build(&loaded.dump, &loaded.graph, &view.excludes, |heap| {
+            let details = read_details(heap, &loaded.source, &view);
+            progress.stage("computing dominators");
+            details
+        });
+        let mut session = Session::new(heap, loaded.source, view);
+        session.prepare(details?);
+        then(session)
     })
 }
 
@@ -196,7 +203,7 @@ fn load(path: &Path, opts: &Load) -> Result<Loaded> {
             source.seekable = hprof::View::file(&done).ok();
         }
     }
-    let dump = indexer.finish(&name, &reader, header, walked, opts.sizes)?;
+    let (dump, references) = indexer.finish(&name, &reader, header, walked, opts.sizes)?;
     drop(reader);
     if dump.objects.is_empty() {
         return Err(Error::Dump(format!(
@@ -204,7 +211,7 @@ fn load(path: &Path, opts: &Load) -> Result<Loaded> {
         )));
     }
     source.id_size = dump.header.id_size;
-    let graph = graph::build(&dump, &source, opts.reference_policy)?;
+    let graph = graph::build(&dump, &source, opts.reference_policy, references)?;
     Ok(Loaded { dump, graph, source, index: dir.map(|dir| (dir, key)) })
 }
 
@@ -222,8 +229,7 @@ pub struct Session<'a> {
 }
 
 impl<'a> Session<'a> {
-    fn new(mut heap: Heap<'a>, source: Source, view: View) -> Session<'a> {
-        heap.set_excludes(&view.excludes);
+    fn new(heap: Heap<'a>, source: Source, view: View) -> Session<'a> {
         Session {
             heap,
             source,
@@ -236,91 +242,14 @@ impl<'a> Session<'a> {
         }
     }
 
-    /// First detail read: thread names, array hashes, boxed values, direct buffer bodies and any search.
-    fn prepare(&mut self) -> Result<()> {
-        let (heap, view) = (&self.heap, &self.view);
-        let (dump, graph) = (heap.dump, heap.graph);
-        self.strings = strings::strings(dump, graph);
-        let mut request = Request::default();
-        for thread in &dump.threads {
-            if let Some(name) = heap.field(thread.object, "name") {
-                strings::string_ids(dump, graph, name, &mut request.want);
-            }
-        }
-        let shows = |section: Section| view.sections.has(section) && !view.focused();
-        let mut arrays = Vec::new();
-        if view.sections.needs_hashes() && !view.focused() {
-            request.hash = self.strings.iter().map(|&(_, array)| dump.objects[array as usize].id).collect();
-        }
-        if shows(Section::Arrays) {
-            arrays = heap.hashable_arrays(&self.strings);
-            request.content = arrays.iter().map(|&array| dump.objects[array as usize].id).collect();
-        }
-        if shows(Section::Boxed) {
-            request.boxed = heap
-                .boxed_classes()
-                .into_iter()
-                .map(|(class, id, offset, ty)| (id, (class, offset, ty)))
-                .collect();
-        }
-        let buffers = if shows(Section::Direct) { heap.direct_buffers() } else { Vec::new() };
-        request.want.extend(heap.direct_wants(&buffers));
-        self.add_search(&mut request, view.find.as_deref(), view.filter.as_deref())?;
-        let fetched = detail::fetch(&self.source, dump, request)?;
-
-        let names: Vec<String> = dump
-            .threads
-            .iter()
-            .map(|thread| {
-                heap.field(thread.object, "name")
-                    .and_then(|name| strings::string_text(dump, graph, &fetched, name))
-                    .unwrap_or_default()
-            })
-            .collect();
-        let hash_of = |array: u32| fetched.hash_of(dump.objects[array as usize].id);
-        if shows(Section::Strings) {
-            self.inputs.duplicates = Some(heap.duplicates(&self.strings, hash_of));
-        }
-        if shows(Section::Arrays) {
-            self.inputs.array_duplicates = Some(heap.array_duplicates(&arrays, hash_of));
-        }
-        if shows(Section::Boxed) {
-            self.inputs.boxed = heap.boxed(&fetched.boxed);
-        }
-        if shows(Section::Direct) {
-            self.inputs.direct = Some(heap.direct(&buffers, &fetched));
-        }
+    /// Take in the first detail read; search hits are ranked by retained size, so only now.
+    fn prepare(&mut self, details: Details) {
+        let Details { strings, fetched, names, inputs } = details;
+        self.strings = strings;
+        self.inputs = inputs;
         self.take_search(&fetched);
         self.heap.thread_names = names;
         self.fetched = fetched;
-        Ok(())
-    }
-
-    /// Add `--find` / `--where` to a request.
-    fn add_search(&self, request: &mut Request, find: Option<&str>, filter: Option<&str>) -> Result<()> {
-        let (heap, dump) = (&self.heap, self.heap.dump);
-        if let Some(text) = find {
-            let ids = self.strings.iter().map(|&(_, array)| dump.objects[array as usize].id).collect();
-            request.search = Some((ids, strings::Needle::new(text)));
-        }
-        if let Some(text) = filter {
-            let usage = || Error::Usage(format!("`{text}`: expected CLASS.FIELD=VALUE"));
-            let (class_field, expect) = text.rsplit_once('=').ok_or_else(usage)?;
-            let (class, field) = class_field.rsplit_once('.').ok_or_else(usage)?;
-            let classes: dump::FastMap<u64, (u32, hprof::Ty)> = heap
-                .classes_matching(&Pattern::parse(class))
-                .into_iter()
-                .filter_map(|class_index| {
-                    dump.field_offset(class_index, field)
-                        .map(|slot| (dump.classes[class_index as usize].id, slot))
-                })
-                .collect();
-            if classes.is_empty() {
-                return Err(Error::Usage(format!("no class matching `{class}` has a field `{field}`")));
-            }
-            request.filter = Some(Filter { classes, expect: expect.trim().to_string() });
-        }
-        Ok(())
     }
 
     /// Turn a read's search hits into objects, biggest retained first.
@@ -333,7 +262,7 @@ impl<'a> Session<'a> {
         }
         let mut by_array: dump::FastMap<u64, u32> = dump::FastMap::default();
         for &(string, array) in &self.strings {
-            by_array.entry(dump.objects[array as usize].id).or_insert(string);
+            by_array.entry(dump.objects.id(array as usize)).or_insert(string);
         }
         let mut found: Vec<u32> = fetched.found.iter().filter_map(|id| by_array.get(id).copied()).collect();
         found.sort_by(|&a, &b| heap.retained(b).cmp(&heap.retained(a)).then(a.cmp(&b)));
@@ -346,7 +275,7 @@ impl<'a> Session<'a> {
     /// Run a search read for the shell.
     pub fn search(&mut self, find: Option<&str>, filter: Option<&str>) -> Result<()> {
         let mut request = Request::default();
-        self.add_search(&mut request, find, filter)?;
+        add_search(&self.heap, &self.strings, &mut request, find, filter)?;
         let fetched = detail::fetch(&self.source, self.heap.dump, request)?;
         self.take_search(&fetched);
         Ok(())
@@ -370,4 +299,105 @@ impl<'a> Session<'a> {
             plan.render(&self.fetched, self.color, elapsed)
         })
     }
+}
+
+/// What the first detail read brought back, and what the report makes of it before the dominators.
+struct Details {
+    /// Every String with its backing array.
+    strings: Vec<(u32, u32)>,
+    fetched: Fetched,
+    /// One per `dump.threads`.
+    names: Vec<String>,
+    inputs: Inputs,
+}
+
+/// First detail read: thread names, array hashes, boxed values, direct buffer bodies and any search, then
+/// the duplicate groups and the rest that need no dominators. It runs while the dominator tree is built.
+fn read_details(heap: &Heap, source: &Source, view: &View) -> Result<Details> {
+    let (dump, graph) = (heap.dump, heap.graph);
+    let strings = strings::strings(dump, graph);
+    let mut request = Request::default();
+    for thread in &dump.threads {
+        if let Some(name) = heap.field(thread.object, "name") {
+            strings::string_ids(dump, graph, name, &mut request.want);
+        }
+    }
+    let shows = |section: Section| view.sections.has(section) && !view.focused();
+    let mut arrays = Vec::new();
+    if view.sections.needs_hashes() && !view.focused() {
+        request.hash = strings.iter().map(|&(_, array)| dump.objects.id(array as usize)).collect();
+    }
+    if shows(Section::Arrays) {
+        arrays = heap.hashable_arrays(&strings);
+        request.content = arrays.iter().map(|&array| dump.objects.id(array as usize)).collect();
+    }
+    if shows(Section::Boxed) {
+        request.boxed = heap
+            .boxed_classes()
+            .into_iter()
+            .map(|(class, id, offset, ty)| (id, (class, offset, ty)))
+            .collect();
+    }
+    let buffers = if shows(Section::Direct) { heap.direct_buffers() } else { Vec::new() };
+    request.want.extend(heap.direct_wants(&buffers));
+    add_search(heap, &strings, &mut request, view.find.as_deref(), view.filter.as_deref())?;
+    let fetched = detail::fetch(source, dump, request)?;
+
+    let names = dump
+        .threads
+        .iter()
+        .map(|thread| {
+            heap.field(thread.object, "name")
+                .and_then(|name| strings::string_text(dump, graph, &fetched, name))
+                .unwrap_or_default()
+        })
+        .collect();
+    let hash_of = |array: u32| fetched.hash_of(dump.objects.id(array as usize));
+    let mut inputs = Inputs::default();
+    if shows(Section::Strings) {
+        inputs.duplicates = Some(heap.duplicates(&strings, hash_of));
+    }
+    if shows(Section::Arrays) {
+        inputs.array_duplicates = Some(heap.array_duplicates(&arrays, hash_of));
+    }
+    if shows(Section::Boxed) {
+        inputs.boxed = heap.boxed(&fetched.boxed);
+    }
+    if shows(Section::Direct) {
+        inputs.direct = Some(heap.direct(&buffers, &fetched));
+    }
+    Ok(Details { strings, fetched, names, inputs })
+}
+
+/// Add `--find` / `--where` to a request.
+fn add_search(
+    heap: &Heap,
+    strings: &[(u32, u32)],
+    request: &mut Request,
+    find: Option<&str>,
+    filter: Option<&str>,
+) -> Result<()> {
+    let dump = heap.dump;
+    if let Some(text) = find {
+        let ids = strings.iter().map(|&(_, array)| dump.objects.id(array as usize)).collect();
+        request.search = Some((ids, strings::Needle::new(text)));
+    }
+    if let Some(text) = filter {
+        let usage = || Error::Usage(format!("`{text}`: expected CLASS.FIELD=VALUE"));
+        let (class_field, expect) = text.rsplit_once('=').ok_or_else(usage)?;
+        let (class, field) = class_field.rsplit_once('.').ok_or_else(usage)?;
+        let classes: dump::FastMap<u64, (u32, hprof::Ty)> = heap
+            .classes_matching(&Pattern::parse(class))
+            .into_iter()
+            .filter_map(|class_index| {
+                dump.field_offset(class_index, field)
+                    .map(|slot| (dump.classes[class_index as usize].id, slot))
+            })
+            .collect();
+        if classes.is_empty() {
+            return Err(Error::Usage(format!("no class matching `{class}` has a field `{field}`")));
+        }
+        request.filter = Some(Filter { classes, expect: expect.trim().to_string() });
+    }
+    Ok(())
 }

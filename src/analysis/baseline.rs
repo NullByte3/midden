@@ -96,7 +96,7 @@ impl Heap<'_> {
         if loader == crate::dump::NONE {
             return "bootstrap".to_string();
         }
-        let id = dump.objects[loader as usize].id;
+        let id = dump.objects.id(loader as usize);
         let first = dump
             .classes
             .iter()

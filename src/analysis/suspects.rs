@@ -175,7 +175,7 @@ impl Heap<'_> {
                     until = tree.subtree_end[pos as usize];
                 }
                 if pos < until {
-                    tally.add(&dump.objects[object as usize]);
+                    tally.add(dump.objects.get(object as usize));
                 }
             }
             tally

@@ -167,13 +167,13 @@ impl Heap<'_> {
             Shape::Array(field) => {
                 let array = graph.field(collection, field)?;
                 stats.backing = array;
-                stats.capacity = u64::from(self.dump.objects[array as usize].len);
+                stats.capacity = u64::from(self.dump.objects.get(array as usize).len);
                 stats.entries = graph.edges(array).len() as u64;
             }
             Shape::Identity(field) => {
                 let array = graph.field(collection, field)?;
                 stats.backing = array;
-                stats.capacity = u64::from(self.dump.objects[array as usize].len) / 2;
+                stats.capacity = u64::from(self.dump.objects.get(array as usize).len) / 2;
                 stats.entries = graph
                     .edges(array)
                     .labels()
@@ -183,7 +183,7 @@ impl Heap<'_> {
             Shape::Hash { table, next } => {
                 let Some(buckets) = graph.field(collection, table) else { return Some(stats) };
                 stats.backing = buckets;
-                stats.capacity = u64::from(self.dump.objects[buckets as usize].len);
+                stats.capacity = u64::from(self.dump.objects.get(buckets as usize).len);
                 stats.used_buckets = graph.edges(buckets).len() as u64;
                 self.hash_nodes(buckets, next, &mut count);
                 stats.entries = nodes;
@@ -353,7 +353,7 @@ impl Heap<'_> {
             if !self.reachable(object) {
                 continue;
             }
-            let record = &dump.objects[object as usize];
+            let record = dump.objects.get(object as usize);
             if record.kind == Kind::ObjectArray {
                 part.sparse.extend(self.sparse_array(object, ref_size));
                 continue;
@@ -399,7 +399,7 @@ impl Heap<'_> {
 
     /// A big plain object array, owned by no collection, under half filled.
     fn sparse_array(&self, object: u32, ref_size: u64) -> Option<Sparse> {
-        let record = &self.dump.objects[object as usize];
+        let record = self.dump.objects.get(object as usize);
         let filled = self.graph.edges(object).len() as u64;
         let idom = self.dominators.idom[object as usize];
         let backs_collection = idom != self.graph.root && self.shape_of(idom).is_some();

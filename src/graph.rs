@@ -6,8 +6,10 @@ use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
 use super::dump::{Dump, Kind, RefKind};
 use super::hprof::{self, Body, IO_BUFFER_SIZE, Sink, Ty, be_uint};
+use super::index::References;
 use super::parallel;
 use super::source::Source;
+use super::store::Column;
 use crate::error::{Error, Result};
 
 /// Label flag: the edge is an array element, the low bits are its index.
@@ -38,9 +40,9 @@ pub type Parts<'a> = (&'a [u64], &'a [u32], &'a [u32], &'a [(u32, u32)]);
 pub struct Graph {
     /// The virtual root every GC root hangs off; equals the object count.
     pub root: u32,
-    offsets: Vec<u64>,
-    targets: Vec<u32>,
-    labels: Vec<u32>,
+    offsets: Column<u64>,
+    targets: Column<u32>,
+    labels: Column<u32>,
     /// Referent edges left out of the graph proper, sorted by source.
     weak: Vec<(u32, u32)>,
     /// References to ids the dump does not contain.
@@ -59,10 +61,6 @@ pub struct Edges<'a> {
 impl<'a> Edges<'a> {
     pub fn len(&self) -> usize {
         self.targets.len()
-    }
-
-    pub fn get(&self, i: usize) -> Option<u32> {
-        self.targets.get(i).copied()
     }
 
     pub fn targets(&self) -> impl Iterator<Item = u32> + 'a {
@@ -84,6 +82,16 @@ impl<'a> Edges<'a> {
 }
 
 impl Graph {
+    /// Where `object`'s edges sit in [`Graph::all_targets`].
+    pub fn span(&self, object: u32) -> std::ops::Range<usize> {
+        self.offsets[object as usize] as usize..self.offsets[object as usize + 1] as usize
+    }
+
+    /// Every edge's target, object by object.
+    pub fn all_targets(&self) -> &[u32] {
+        &self.targets
+    }
+
     pub fn edges(&self, object: u32) -> Edges<'_> {
         let (lo, hi) = (self.offsets[object as usize] as usize, self.offsets[object as usize + 1] as usize);
         Edges { targets: &self.targets[lo..hi], labels: &self.labels[lo..hi] }
@@ -118,9 +126,9 @@ impl Graph {
 
     /// Reassemble a graph from cached parts.
     pub fn from_parts(
-        offsets: Vec<u64>,
-        targets: Vec<u32>,
-        labels: Vec<u32>,
+        offsets: Column<u64>,
+        targets: Column<u32>,
+        labels: Column<u32>,
         weak: Vec<(u32, u32)>,
         dangling: u64,
         roots: Vec<u32>,
@@ -134,13 +142,19 @@ impl Graph {
     }
 }
 
-/// Read every reference in the dump into a graph over object indices.
-pub fn build(dump: &Dump, source: &Source, reference_policy: ReferencePolicy) -> Result<Graph> {
+/// Every reference in the dump as a graph over object indices: from the ids the index pass copied, or
+/// read from the dump when it could not copy them.
+pub fn build(
+    dump: &Dump,
+    source: &Source,
+    reference_policy: ReferencePolicy,
+    references: Option<References>,
+) -> Result<Graph> {
     let object_count = dump.objects.len();
     // offsets[i + 1] holds object i's out-degree until the prefix sum below.
-    let mut offsets = vec![0u64; object_count + 1];
+    let mut offsets = Column::<u64>::zeroed(object_count + 1);
     parallel::chunks(&mut offsets[1..], |start, degrees| {
-        for (degree, object) in degrees.iter_mut().zip(&dump.objects[start..]) {
+        for (degree, object) in degrees.iter_mut().zip(dump.objects.range(start, dump.objects.len())) {
             *degree = match object.kind {
                 Kind::Instance => dump.classes[object.class as usize].slots.len() as u64,
                 Kind::ObjectArray => u64::from(object.len),
@@ -163,7 +177,8 @@ pub fn build(dump: &Dump, source: &Source, reference_policy: ReferencePolicy) ->
     let total = usize::try_from(offsets[object_count])
         .map_err(|_| Error::Dump("too many references for this machine".into()))?;
     // A target is stored plus one, leaving zero for a hole.
-    let (targets, labels) = (parallel::zeroed(total), parallel::zeroed(total));
+    let (mut target_column, mut label_column) = (Column::<u32>::zeroed(total), Column::<u32>::zeroed(total));
+    let (targets, labels) = (target_column.atomics(), label_column.atomics());
     let mut dangling = 0u64;
     for (idx, class_idx) in class_slots {
         let class = &dump.classes[class_idx as usize];
@@ -172,36 +187,44 @@ pub fn build(dump: &Dump, source: &Source, reference_policy: ReferencePolicy) ->
             if let hprof::Value::Ref(id) = field.value {
                 match (id, dump.lookup(id)) {
                     (0, _) => {}
-                    (_, Some(target)) => set_edge(&targets, &labels, slot, target, field.name),
+                    (_, Some(target)) => set_edge(targets, labels, slot, target, field.name),
                     (_, None) => dangling += 1,
                 }
             }
             slot += 1;
         }
         if let Some(target) = (class.loader != 0).then(|| dump.lookup(class.loader)).flatten() {
-            set_edge(&targets, &labels, slot, target, LOADER);
+            set_edge(targets, labels, slot, target, LOADER);
         }
     }
 
-    let fillers = source.scan(&dump.chunks, "reading references", || Filler {
-        dump,
-        offsets: &offsets,
-        targets: &targets,
-        labels: &labels,
-        weak: Vec::new(),
-        reference_policy,
-        dangling: 0,
-        next: 0,
-    })?;
+    let found = match &references {
+        Some(references) => resolve(dump, references, &offsets, targets, labels, reference_policy),
+        None => source
+            .scan(&dump.chunks, "reading references", || Filler {
+                dump,
+                offsets: &offsets,
+                targets,
+                labels,
+                weak: Vec::new(),
+                reference_policy,
+                dangling: 0,
+                next: 0,
+            })?
+            .into_iter()
+            .map(|filler| (filler.weak, filler.dangling))
+            .collect(),
+    };
+    drop(references);
     let mut weak: Vec<(u32, u32)> = Vec::new();
-    for filler in fillers {
-        dangling += filler.dangling;
-        weak.extend(filler.weak);
+    for (part_weak, part_dangling) in found {
+        dangling += part_dangling;
+        weak.extend(part_weak);
     }
     weak.sort_unstable();
 
     // Squeeze out null and dangling holes: each worker packs its range to the front, then ranges close up.
-    let mut packed = vec![0u64; object_count + 1];
+    let mut packed = Column::<u64>::zeroed(object_count + 1);
     let blocks = parallel::chunks(&mut packed[1..], |start, ends| {
         let (from, mut dst) = (offsets[start] as usize, offsets[start] as usize);
         for (i, end) in (start..).zip(ends.iter_mut()) {
@@ -217,8 +240,7 @@ pub fn build(dump: &Dump, source: &Source, reference_policy: ReferencePolicy) ->
         }
         (start + ends.len(), from, dst)
     });
-    let mut targets: Vec<u32> = targets.into_iter().map(AtomicU32::into_inner).collect();
-    let mut labels: Vec<u32> = labels.into_iter().map(AtomicU32::into_inner).collect();
+    let (mut targets, mut labels) = (target_column, label_column);
     let (mut dst, mut start) = (0usize, 0usize);
     for (end, from, upto) in blocks {
         // Skip blocks already in place; a self-copy still costs.
@@ -240,6 +262,55 @@ pub fn build(dump: &Dump, source: &Source, reference_policy: ReferencePolicy) ->
     roots.sort_unstable();
     roots.dedup();
     Ok(Graph { root: object_count as u32, offsets: packed, targets, labels, weak, dangling, roots })
+}
+
+/// Turn the copied ids into edges, a range of objects per worker. The same rules as [`Filler`]: a referent
+/// the policy does not keep goes to the weak list, an id the dump lacks is counted as dangling.
+fn resolve(
+    dump: &Dump,
+    references: &References,
+    offsets: &[u64],
+    targets: &[AtomicU32],
+    labels: &[AtomicU32],
+    reference_policy: ReferencePolicy,
+) -> Vec<(Vec<(u32, u32)>, u64)> {
+    parallel::ranges(dump.objects.len(), |lo, hi| {
+        let (mut weak, mut dangling) = (Vec::new(), 0u64);
+        for (idx, object) in (lo as u32..).zip(dump.objects.range(lo, hi)) {
+            let (start, base) = (references.starts[idx as usize] as usize, offsets[idx as usize] as usize);
+            match object.kind {
+                Kind::Instance => {
+                    let class = &dump.classes[object.class as usize];
+                    let kept_referent = reference_policy.keeps(class.ref_kind.unwrap_or(RefKind::Weak));
+                    let ids = &references.ids[start..start + class.slots.len()];
+                    for (k, (slot, &target)) in class.slots.iter().zip(ids).enumerate() {
+                        if target == 0 {
+                            continue;
+                        }
+                        match dump.lookup(target) {
+                            Some(target_idx) if slot.weak && !kept_referent => weak.push((idx, target_idx)),
+                            Some(target_idx) => set_edge(targets, labels, base + k, target_idx, slot.label),
+                            None => dangling += 1,
+                        }
+                    }
+                }
+                Kind::ObjectArray => {
+                    let ids = &references.ids[start..start + object.len as usize];
+                    for (element, &target) in ids.iter().enumerate().filter(|&(_, &target)| target != 0) {
+                        match dump.lookup(target) {
+                            Some(target_idx) => {
+                                let label = ARRAY_ELEMENT | element as u32;
+                                set_edge(targets, labels, base + element, target_idx, label);
+                            }
+                            None => dangling += 1,
+                        }
+                    }
+                }
+                Kind::PrimitiveArray | Kind::Class => {}
+            }
+        }
+        (weak, dangling)
+    })
 }
 
 fn set_edge(targets: &[AtomicU32], labels: &[AtomicU32], slot: usize, target: u32, label: u32) {
@@ -267,8 +338,9 @@ impl Filler<'_> {
         let near = self
             .dump
             .objects
+            .ids()
             .get(self.next..)
-            .and_then(|rest| rest.iter().take(2).position(|object| object.id == id));
+            .and_then(|rest| rest.iter().take(2).position(|&next| next == id));
         let idx = near.map(|ahead| (self.next + ahead) as u32).or_else(|| self.dump.lookup(id));
         if let Some(i) = idx {
             self.next = i as usize + 1;
