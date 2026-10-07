@@ -4,7 +4,7 @@
 use std::io;
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
-use super::dump::{Dump, Kind, RefKind};
+use super::dump::{Dump, Kind, RefKind, Slot};
 use super::hprof::{self, Body, IO_BUFFER_SIZE, Sink, Ty, be_uint};
 use super::index::References;
 use super::parallel;
@@ -151,24 +151,44 @@ pub fn build(
     references: Option<References>,
 ) -> Result<Graph> {
     let object_count = dump.objects.len();
-    // offsets[i + 1] holds object i's out-degree until the prefix sum below.
+    // offsets[i + 1] holds object i's out-degree until the prefix sum below. Read from the dump, every slot
+    // gets a place and the holes are squeezed out after; copied ids are counted first, so only dangling
+    // ones leave holes.
     let mut offsets = Column::<u64>::zeroed(object_count + 1);
     parallel::chunks(&mut offsets[1..], |start, degrees| {
-        for (degree, object) in degrees.iter_mut().zip(dump.objects.range(start, dump.objects.len())) {
-            *degree = match object.kind {
-                Kind::Instance => dump.classes[object.class as usize].slots.len() as u64,
-                Kind::ObjectArray => u64::from(object.len),
-                Kind::PrimitiveArray | Kind::Class => 0,
+        for ((degree, object), idx) in
+            degrees.iter_mut().zip(dump.objects.range(start, dump.objects.len())).zip(start..)
+        {
+            *degree = match (object.kind, &references) {
+                (Kind::Instance, None) => dump.classes[object.class as usize].slots.len() as u64,
+                (Kind::ObjectArray, None) => u64::from(object.len),
+                (Kind::Instance, Some(references)) => {
+                    let class = &dump.classes[object.class as usize];
+                    let kept_referent = reference_policy.keeps(class.ref_kind.unwrap_or(RefKind::Weak));
+                    let start = references.starts[idx] as usize;
+                    let copied = &references.copied.ids[start..start + class.slots.len()];
+                    let edge = |(slot, &id): (&Slot, &u32)| id != 0 && (kept_referent || !slot.weak);
+                    class.slots.iter().zip(copied).filter(|&pair| edge(pair)).count() as u64
+                }
+                (Kind::ObjectArray, Some(references)) => {
+                    let start = references.starts[idx] as usize;
+                    let copied = &references.copied.ids[start..start + object.len as usize];
+                    copied.iter().filter(|&&id| id != 0).count() as u64
+                }
+                (Kind::PrimitiveArray | Kind::Class, _) => 0,
             };
         }
     });
     // Class objects: one edge per reference-typed static, plus the loader.
+    let exact = references.is_some();
+    let static_edge = |id: u64| !exact || (id != 0 && dump.lookup(id).is_some());
     let mut class_slots: Vec<(u32, u32)> = Vec::new();
     for (class_idx, class) in dump.classes.iter().enumerate() {
         if let Some(idx) = class.dumped.then(|| dump.lookup(class.id)).flatten() {
-            let ref_count = class.statics.iter().filter(|field| field.ty == Ty::Object).count() as u64 + 1;
+            let statics = class.statics.iter().filter(|field| field.ty == Ty::Object);
+            let edges = statics.filter(|field| static_edge(field.value.bits())).count() as u64;
             class_slots.push((idx, class_idx as u32));
-            offsets[idx as usize + 1] += ref_count;
+            offsets[idx as usize + 1] += edges + u64::from(static_edge(class.loader));
         }
     }
     for i in 0..object_count {
@@ -191,7 +211,7 @@ pub fn build(
                     (_, None) => dangling += 1,
                 }
             }
-            slot += 1;
+            slot += usize::from(static_edge(field.value.bits()));
         }
         if let Some(target) = (class.loader != 0).then(|| dump.lookup(class.loader)).flatten() {
             set_edge(targets, labels, slot, target, LOADER);
@@ -217,11 +237,22 @@ pub fn build(
     };
     drop(references);
     let mut weak: Vec<(u32, u32)> = Vec::new();
+    // Read from the dump every null is a hole; counted from copied ids only dangling ones are.
+    let mut holes = !exact;
     for (part_weak, part_dangling) in found {
         dangling += part_dangling;
+        holes |= part_dangling > 0;
         weak.extend(part_weak);
     }
     weak.sort_unstable();
+    let mut roots: Vec<u32> = dump.roots.iter().map(|&(object, _)| object).collect();
+    roots.sort_unstable();
+    roots.dedup();
+    if !holes {
+        let (mut targets, labels) = (target_column, label_column);
+        parallel::chunks(&mut targets, |_, part| part.iter_mut().for_each(|target| *target -= 1));
+        return Ok(Graph { root: object_count as u32, offsets, targets, labels, weak, dangling, roots });
+    }
 
     // Squeeze out null and dangling holes: each worker packs its range to the front, then ranges close up.
     let mut packed = Column::<u64>::zeroed(object_count + 1);
@@ -257,15 +288,11 @@ pub fn build(
     labels.truncate(dst);
     targets.shrink_to_fit();
     labels.shrink_to_fit();
-
-    let mut roots: Vec<u32> = dump.roots.iter().map(|&(object, _)| object).collect();
-    roots.sort_unstable();
-    roots.dedup();
     Ok(Graph { root: object_count as u32, offsets: packed, targets, labels, weak, dangling, roots })
 }
 
-/// Turn the copied ids into edges, a range of objects per worker. The same rules as [`Filler`]: a referent
-/// the policy does not keep goes to the weak list, an id the dump lacks is counted as dangling.
+/// Turn the copied ids into edges, a range of objects per worker, packed as counted. The same rules as
+/// [`Filler`]: a referent the policy does not keep goes to the weak list, an id the dump lacks is dangling.
 fn resolve(
     dump: &Dump,
     references: &References,
@@ -282,28 +309,36 @@ fn resolve(
                 Kind::Instance => {
                     let class = &dump.classes[object.class as usize];
                     let kept_referent = reference_policy.keeps(class.ref_kind.unwrap_or(RefKind::Weak));
-                    let ids = &references.ids[start..start + class.slots.len()];
-                    for (k, (slot, &target)) in class.slots.iter().zip(ids).enumerate() {
+                    let mut place = base;
+                    for (k, slot) in class.slots.iter().enumerate() {
+                        let target = references.copied.id(start + k);
+                        if target == 0 {
+                            continue;
+                        }
+                        let kept = kept_referent || !slot.weak;
+                        match dump.lookup(target) {
+                            Some(target_idx) if !kept => weak.push((idx, target_idx)),
+                            Some(target_idx) => set_edge(targets, labels, place, target_idx, slot.label),
+                            None => dangling += 1,
+                        }
+                        place += usize::from(kept);
+                    }
+                }
+                Kind::ObjectArray => {
+                    let mut place = base;
+                    for element in 0..object.len as usize {
+                        let target = references.copied.id(start + element);
                         if target == 0 {
                             continue;
                         }
                         match dump.lookup(target) {
-                            Some(target_idx) if slot.weak && !kept_referent => weak.push((idx, target_idx)),
-                            Some(target_idx) => set_edge(targets, labels, base + k, target_idx, slot.label),
-                            None => dangling += 1,
-                        }
-                    }
-                }
-                Kind::ObjectArray => {
-                    let ids = &references.ids[start..start + object.len as usize];
-                    for (element, &target) in ids.iter().enumerate().filter(|&(_, &target)| target != 0) {
-                        match dump.lookup(target) {
                             Some(target_idx) => {
                                 let label = ARRAY_ELEMENT | element as u32;
-                                set_edge(targets, labels, base + element, target_idx, label);
+                                set_edge(targets, labels, place, target_idx, label);
                             }
                             None => dangling += 1,
                         }
+                        place += 1;
                     }
                 }
                 Kind::PrimitiveArray | Kind::Class => {}

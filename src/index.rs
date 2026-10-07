@@ -46,11 +46,90 @@ const STRING_HASH_MAX_BYTES: u64 = 64 << 10;
 /// Primitive array classes by `Ty as usize`; room for every HPROF basic-type tag (long, the largest, is 11).
 const BASIC_TYPE_SLOTS: usize = 12;
 
-/// Every object's reference slots as the walk copied them, ids with zero for null, and where each
-/// object's start, by object index. The graph resolves them without reading the dump again.
+/// Every object's reference slots as the walk copied them, and where each object's start, by object index.
+/// The graph resolves them without reading the dump again.
 pub struct References {
-    pub ids: Column<u64>,
-    pub starts: Column<u64>,
+    pub copied: Copied<Column<u32>>,
+    pub starts: Column<u32>,
+}
+
+/// A copied id too far from the base to fit in four bytes; the whole id is in `escapes`.
+const ESCAPED: u32 = u32::MAX;
+
+/// Reference ids as the walk copies them, four bytes each: the id's distance above `base` in 8-byte steps
+/// plus one, zero for null, and [`ESCAPED`] for one that does not fit, kept whole in `escapes` by place.
+pub struct Copied<C> {
+    pub ids: C,
+    pub escapes: Vec<(u64, u64)>,
+    pub base: u64,
+}
+
+impl<C: Ids> Copied<C> {
+    fn new(ids: C, base: u64) -> Copied<C> {
+        Copied { ids, escapes: Vec::new(), base }
+    }
+
+    pub fn len(&self) -> usize {
+        self.ids.count()
+    }
+}
+
+impl Copied<Column<u32>> {
+    /// The id copied at `at`, zero for null.
+    pub fn id(&self, at: usize) -> u64 {
+        match self.ids[at] {
+            0 => 0,
+            ESCAPED => self
+                .escapes
+                .binary_search_by_key(&(at as u64), |&(place, _)| place)
+                .map_or(0, |i| self.escapes[i].1),
+            steps => self.base + (u64::from(steps - 1) << 3),
+        }
+    }
+}
+
+impl<C: Ids> Extend<u64> for Copied<C> {
+    fn extend<I: IntoIterator<Item = u64>>(&mut self, ids: I) {
+        for id in ids {
+            let steps = id
+                .checked_sub(self.base)
+                .filter(|distance| distance.trailing_zeros() >= 3)
+                .and_then(|distance| u32::try_from((distance >> 3) + 1).ok())
+                .filter(|&steps| steps != ESCAPED)
+                .unwrap_or(ESCAPED);
+            let value = if id == 0 { 0 } else { steps };
+            if value == ESCAPED {
+                self.escapes.push((self.ids.count() as u64, id));
+            }
+            self.ids.put(value);
+        }
+    }
+}
+
+/// Where copied ids go: a column for the whole walk, a `Vec` for a worker's part.
+pub trait Ids {
+    fn count(&self) -> usize;
+    fn put(&mut self, value: u32);
+}
+
+impl Ids for Column<u32> {
+    fn count(&self) -> usize {
+        self.len()
+    }
+
+    fn put(&mut self, value: u32) {
+        self.push(value);
+    }
+}
+
+impl Ids for Vec<u32> {
+    fn count(&self) -> usize {
+        self.len()
+    }
+
+    fn put(&mut self, value: u32) {
+        self.push(value);
+    }
 }
 
 pub struct Indexer {
@@ -65,7 +144,7 @@ pub struct Indexer {
     name_by_text: HashMap<String, u32>,
     name_by_id: FastMap<u64, u32>,
     objects: Column<Raw>,
-    references: Column<u64>,
+    references: Copied<Column<u32>>,
     hashes: Column<[u64; 2]>,
     /// Per class: where a boxed class keeps its value.
     boxed: Vec<Option<(u32, Ty)>>,
@@ -94,7 +173,7 @@ impl Indexer {
             name_by_text: HashMap::new(),
             name_by_id: FastMap::default(),
             objects: Column::with_capacity(0),
-            references: Column::with_capacity(0),
+            references: Copied::new(Column::with_capacity(0), 0),
             hashes: Column::with_capacity(0),
             boxed: Vec::new(),
             boxed_values: FastMap::default(),
@@ -147,6 +226,8 @@ impl Indexer {
             self.late = true;
             return;
         }
+        // Class mirrors sit in the heap, so the lowest is a good base for the copied ids.
+        self.references.base = self.class_by_id.keys().copied().filter(|&id| id != 0).min().unwrap_or(0) & !7;
         self.resolve_class_dumps();
         // Reference slots do not depend on the size convention; `finish` lays out again with the real one.
         self.lay_out_classes(&Sizing::resolve(SizeMode::Mat, self.id_size, 0));
@@ -306,7 +387,7 @@ struct Part<'a> {
     copying: bool,
     class_dumps: Vec<ClassDump>,
     objects: Vec<Raw>,
-    references: Vec<u64>,
+    references: Copied<Vec<u32>>,
     hashes: Vec<[u64; 2]>,
     boxed_values: FastMap<(u32, u64), u64>,
     roots: Vec<Root>,
@@ -347,7 +428,7 @@ impl Sink for Part<'_> {
 struct Parsed {
     class_dumps: Vec<ClassDump>,
     objects: Vec<Raw>,
-    references: Vec<u64>,
+    references: Copied<Vec<u32>>,
     hashes: Vec<[u64; 2]>,
     boxed_values: FastMap<(u32, u64), u64>,
     copied: bool,
@@ -390,8 +471,8 @@ impl Indexer {
             prim_array_classes[ty as usize] = class_named(&self.classes, &name).unwrap_or(NONE);
         }
         progress.begin("indexing objects", runs.iter().map(|&(start, end)| end - start).sum());
-        let (id_size, class_by_id, classes, boxed, copying) =
-            (self.id_size, &self.class_by_id, &self.classes, &self.boxed, !self.late);
+        let (id_size, class_by_id, classes, boxed, copying, base) =
+            (self.id_size, &self.class_by_id, &self.classes, &self.boxed, !self.late, self.references.base);
         let (mut complete, mut class_dumps) = (true, Vec::new());
         parallel::ordered(
             &runs,
@@ -408,7 +489,7 @@ impl Indexer {
                     copying,
                     class_dumps: Vec::new(),
                     objects: Vec::new(),
-                    references: Vec::new(),
+                    references: Copied::new(Vec::new(), base),
                     hashes: Vec::new(),
                     boxed_values: FastMap::default(),
                     roots: Vec::new(),
@@ -436,7 +517,9 @@ impl Indexer {
                 // Starts are the part's own: move them past what earlier parts copied.
                 let (reference_base, hash_base) = (self.references.len() as u64, self.hashes.len() as u64);
                 if !self.late {
-                    self.references.extend_from_slice(&part.references);
+                    let escapes = part.references.escapes.iter().map(|&(at, id)| (at + reference_base, id));
+                    self.references.escapes.extend(escapes);
+                    self.references.ids.extend_from_slice(&part.references.ids);
                 }
                 self.hashes.extend_from_slice(&part.hashes);
                 for (key, count) in part.boxed_values {
@@ -479,7 +562,8 @@ impl Indexer {
         let max_id = self.objects.iter().map(|record| record[0]).max().unwrap_or(0);
         let sizing = Sizing::resolve(mode, self.id_size, max_id);
         self.lay_out_classes(&sizing);
-        let keep = self.frozen && !self.late;
+        // Starts are four bytes: a walk that copied more ids than that reads the references again.
+        let keep = self.frozen && !self.late && self.references.len() < u32::MAX as usize;
         let (objects, class_class, starts, array_hashes) = self.size_objects(sizing, keep);
         // u32 indices keep NONE free and the graph root one past the objects; labels stay below LOADER.
         let counts = [
@@ -495,7 +579,7 @@ impl Indexer {
         let lookup = Buckets::build(objects.ids());
         let string_class = class_named(&self.classes, "java.lang.String").unwrap_or(NONE);
         let references = keep.then(|| References {
-            ids: std::mem::replace(&mut self.references, Column::with_capacity(0)),
+            copied: std::mem::replace(&mut self.references, Copied::new(Column::with_capacity(0), 0)),
             starts,
         });
 
@@ -588,7 +672,7 @@ impl Indexer {
     /// The object table: the walk's records and the class objects merged by id, one of each id kept,
     /// instances counted. Also returns the `java.lang.Class` class, where each kept object's copied
     /// references start when `keep`, and the primitive arrays' hashes by object index.
-    fn size_objects(&mut self, sizing: Sizing, keep: bool) -> (ObjectTable, u32, Column<u64>, ArrayHashes) {
+    fn size_objects(&mut self, sizing: Sizing, keep: bool) -> (ObjectTable, u32, Column<u32>, ArrayHashes) {
         // Class objects live in the object table too: statics are edges and
         // sticky-class roots point at them.
         let class_class = class_named(&self.classes, "java.lang.Class")
@@ -640,7 +724,7 @@ impl Indexer {
                 }
                 table.push(record[0], class, kind, record[1] as u32);
                 if keep {
-                    starts.push(record[2]);
+                    starts.push(record[2] as u32);
                 }
             }
         });
