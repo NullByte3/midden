@@ -6,14 +6,16 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::io;
 use std::sync::Arc;
 
+use super::analysis::duplicates::boxed_classes;
+use super::detail::ArrayHash;
 use super::dump::{
-    self, Buckets, Class, Dump, FastMap, Field, Kind, MAX_CLASS_DEPTH, MAX_CLASSES, NONE, ObjectTable,
-    RefKind, Slot, Static,
+    self, ArrayHashes, Buckets, Class, Dump, FastMap, Field, Kind, MAX_CLASS_DEPTH, MAX_CLASSES, NONE,
+    ObjectTable, RefKind, Slot, Static,
 };
 use super::graph::LOADER;
 use super::hprof::{
-    self, Body, ClassDump, Frame, Header, IO_BUFFER_SIZE, Reader, Root, RootKind, Sink, Ty, View, Walked,
-    be_uint,
+    self, Body, ClassDump, Frame, Header, IO_BUFFER_SIZE, Reader, Root, RootKind, Sink, Ty, Value, View,
+    Walked, be_uint,
 };
 use super::parallel;
 use super::sizes::{SizeMode, Sizing};
@@ -21,8 +23,8 @@ use super::source::Progress;
 use super::store::Column;
 use crate::error::{Error, Result};
 
-/// An object as the walk meets it: id, then class and kind above the length, then where its
-/// references start in the copied ids (`raw`).
+/// An object as the walk meets it: id, then class and kind above the length, then where its references
+/// start in the copied ids, or for a primitive array where its hashes are (`raw`).
 type Raw = [u64; 3];
 
 fn raw(id: u64, class: u32, kind: Kind, len: u32, references: usize) -> Raw {
@@ -36,6 +38,10 @@ fn raw_class(record: Raw) -> u32 {
 fn raw_kind(record: Raw) -> Kind {
     Kind::ALL[(record[1] >> 32 & 3) as usize]
 }
+
+/// Byte and char arrays up to this long get the String hash as the walk reads them; a String's longer
+/// array is hashed by the detail read.
+const STRING_HASH_MAX_BYTES: u64 = 64 << 10;
 
 /// Primitive array classes by `Ty as usize`; room for every HPROF basic-type tag (long, the largest, is 11).
 const BASIC_TYPE_SLOTS: usize = 12;
@@ -60,6 +66,10 @@ pub struct Indexer {
     name_by_id: FastMap<u64, u32>,
     objects: Column<Raw>,
     references: Column<u64>,
+    hashes: Column<[u64; 2]>,
+    /// Per class: where a boxed class keeps its value.
+    boxed: Vec<Option<(u32, Ty)>>,
+    boxed_values: FastMap<(u32, u64), u64>,
     /// Layouts are fixed and the walk copies references from here on.
     frozen: bool,
     /// A class dump came after the layouts were fixed: the references are read in a second pass.
@@ -85,6 +95,9 @@ impl Indexer {
             name_by_id: FastMap::default(),
             objects: Column::with_capacity(0),
             references: Column::with_capacity(0),
+            hashes: Column::with_capacity(0),
+            boxed: Vec::new(),
+            boxed_values: FastMap::default(),
             frozen: false,
             late: false,
             roots: Vec::new(),
@@ -137,6 +150,10 @@ impl Indexer {
         self.resolve_class_dumps();
         // Reference slots do not depend on the size convention; `finish` lays out again with the real one.
         self.lay_out_classes(&Sizing::resolve(SizeMode::Mat, self.id_size, 0));
+        self.boxed = vec![None; self.classes.len()];
+        for (class, _, offset, ty) in boxed_classes(&self.classes, &self.names, self.id_size) {
+            self.boxed[class as usize] = Some((offset, ty));
+        }
     }
 
     /// Whether the walk copies references: the layouts are fixed and no class dump came after them.
@@ -148,18 +165,46 @@ impl Indexer {
     }
 }
 
-/// Copy an instance's reference slots from its body: an id each, zero for null or past a short body.
-fn copy_slots(slots: &[Slot], id_size: usize, body: Body, out: &mut impl Extend<u64>) -> io::Result<()> {
-    if slots.is_empty() {
+/// What the walk takes from an instance's body: its reference slots, an id each and zero for null or past
+/// a short body, and a boxed class's value.
+fn copy_instance(
+    (class, slots, boxed): (u32, &[Slot], Option<(u32, Ty)>),
+    id_size: u32,
+    body: Body,
+    references: &mut impl Extend<u64>,
+    boxed_values: &mut FastMap<(u32, u64), u64>,
+) -> io::Result<()> {
+    if slots.is_empty() && boxed.is_none() {
         return Ok(());
     }
     let bytes = body.bytes()?;
-    out.extend(
+    let width = id_size as usize;
+    references.extend(
         slots
             .iter()
-            .map(|slot| bytes.get(slot.offset as usize..slot.offset as usize + id_size).map_or(0, be_uint)),
+            .map(|slot| bytes.get(slot.offset as usize..slot.offset as usize + width).map_or(0, be_uint)),
     );
+    let value = boxed.and_then(|(offset, ty)| Value::decode(ty, bytes.get(offset as usize..)?, id_size));
+    if let Some(value) = value {
+        *boxed_values.entry((class, value.bits())).or_default() += 1;
+    }
     Ok(())
+}
+
+/// A primitive array's hashes, the String one only for a byte or char array of up to
+/// [`STRING_HASH_MAX_BYTES`]; zero stands for not taken.
+fn hash_array(ty: Ty, len: u32, body: Body) -> io::Result<[u64; 2]> {
+    let string = matches!(ty, Ty::Byte | Ty::Char) && body.len() <= STRING_HASH_MAX_BYTES;
+    let mut hash = ArrayHash::new();
+    body.chunks(IO_BUFFER_SIZE, |chunk| {
+        if string {
+            hash.string(chunk);
+        }
+        hash.content(chunk);
+        Ok(())
+    })?;
+    let [string_hash, content_hash] = hash.finish(len);
+    Ok([if string { string_hash } else { 0 }, content_hash])
 }
 
 /// Copy an object array's elements: an id each, zero for null.
@@ -177,12 +222,9 @@ macro_rules! object_callbacks {
             let class = self.class_index(class_id);
             let (len, start) = (body.len() as u32, self.references.len());
             if self.copies() && class != NONE {
-                copy_slots(
-                    &self.classes[class as usize].slots,
-                    self.id_size as usize,
-                    body,
-                    &mut self.references,
-                )?;
+                let boxed = self.boxed.get(class as usize).copied().flatten();
+                let copied = (class, &self.classes[class as usize].slots[..], boxed);
+                copy_instance(copied, self.id_size, body, &mut self.references, &mut self.boxed_values)?;
             }
             self.objects.push(raw(id, class, Kind::Instance, len, start));
             Ok(())
@@ -198,9 +240,11 @@ macro_rules! object_callbacks {
             Ok(())
         }
 
-        fn primitive_array(&mut self, id: u64, ty: Ty, len: u32, _body: Body) -> io::Result<()> {
+        fn primitive_array(&mut self, id: u64, ty: Ty, len: u32, body: Body) -> io::Result<()> {
             let class = self.primitive_array_class(ty);
-            self.objects.push(raw(id, class, Kind::PrimitiveArray, len, 0));
+            let at = self.hashes.len();
+            self.hashes.push(hash_array(ty, len, body)?);
+            self.objects.push(raw(id, class, Kind::PrimitiveArray, len, at));
             Ok(())
         }
     };
@@ -255,6 +299,7 @@ struct Part<'a> {
     id_size: u32,
     class_by_id: &'a FastMap<u64, u32>,
     classes: &'a [Class],
+    boxed: &'a [Option<(u32, Ty)>],
     prim_array_classes: [u32; BASIC_TYPE_SLOTS],
     missed: bool,
     /// Copy references: false once a class dump turned up after the layouts were fixed.
@@ -262,6 +307,8 @@ struct Part<'a> {
     class_dumps: Vec<ClassDump>,
     objects: Vec<Raw>,
     references: Vec<u64>,
+    hashes: Vec<[u64; 2]>,
+    boxed_values: FastMap<(u32, u64), u64>,
     roots: Vec<Root>,
 }
 
@@ -301,6 +348,8 @@ struct Parsed {
     class_dumps: Vec<ClassDump>,
     objects: Vec<Raw>,
     references: Vec<u64>,
+    hashes: Vec<[u64; 2]>,
+    boxed_values: FastMap<(u32, u64), u64>,
     copied: bool,
     roots: Vec<Root>,
     walked: Walked,
@@ -341,8 +390,8 @@ impl Indexer {
             prim_array_classes[ty as usize] = class_named(&self.classes, &name).unwrap_or(NONE);
         }
         progress.begin("indexing objects", runs.iter().map(|&(start, end)| end - start).sum());
-        let (id_size, class_by_id, classes, copying) =
-            (self.id_size, &self.class_by_id, &self.classes, !self.late);
+        let (id_size, class_by_id, classes, boxed, copying) =
+            (self.id_size, &self.class_by_id, &self.classes, &self.boxed, !self.late);
         let (mut complete, mut class_dumps) = (true, Vec::new());
         parallel::ordered(
             &runs,
@@ -353,12 +402,15 @@ impl Indexer {
                     id_size,
                     class_by_id,
                     classes,
+                    boxed,
                     prim_array_classes,
                     missed: false,
                     copying,
                     class_dumps: Vec::new(),
                     objects: Vec::new(),
                     references: Vec::new(),
+                    hashes: Vec::new(),
+                    boxed_values: FastMap::default(),
                     roots: Vec::new(),
                 };
                 let mut part_walked = Walked::default();
@@ -367,6 +419,8 @@ impl Indexer {
                     class_dumps: part.class_dumps,
                     objects: part.objects,
                     references: part.references,
+                    hashes: part.hashes,
+                    boxed_values: part.boxed_values,
                     copied: part.copying,
                     roots: part.roots,
                     walked: part_walked,
@@ -379,15 +433,20 @@ impl Indexer {
                 };
                 class_dumps.extend(part.class_dumps);
                 self.late |= !part.copied;
-                if self.late {
-                    self.objects.extend_from_slice(&part.objects);
-                } else {
-                    let base = self.references.len() as u64;
+                // Starts are the part's own: move them past what earlier parts copied.
+                let (reference_base, hash_base) = (self.references.len() as u64, self.hashes.len() as u64);
+                if !self.late {
                     self.references.extend_from_slice(&part.references);
-                    self.objects.reserve(part.objects.len());
-                    for &[id, shape, start] in &part.objects {
-                        self.objects.push([id, shape, start + base]);
-                    }
+                }
+                self.hashes.extend_from_slice(&part.hashes);
+                for (key, count) in part.boxed_values {
+                    *self.boxed_values.entry(key).or_default() += count;
+                }
+                self.objects.reserve(part.objects.len());
+                for &record in &part.objects {
+                    let base =
+                        if raw_kind(record) == Kind::PrimitiveArray { hash_base } else { reference_base };
+                    self.objects.push([record[0], record[1], record[2] + base]);
                 }
                 self.roots.extend(part.roots);
                 walked.chunks.extend(part.walked.chunks);
@@ -421,7 +480,7 @@ impl Indexer {
         let sizing = Sizing::resolve(mode, self.id_size, max_id);
         self.lay_out_classes(&sizing);
         let keep = self.frozen && !self.late;
-        let (objects, class_class, starts) = self.size_objects(sizing, keep);
+        let (objects, class_class, starts, array_hashes) = self.size_objects(sizing, keep);
         // u32 indices keep NONE free and the graph root one past the objects; labels stay below LOADER.
         let counts = [
             ("objects", objects.len(), NONE as usize - 1),
@@ -454,6 +513,8 @@ impl Indexer {
             symbols: self.symbols,
             classes: self.classes,
             objects,
+            array_hashes: Some(array_hashes),
+            boxed_values: keep.then_some(self.boxed_values),
             roots: Vec::new(),
             dangling_roots: 0,
             marked_unreachable: 0,
@@ -525,9 +586,9 @@ impl Indexer {
     }
 
     /// The object table: the walk's records and the class objects merged by id, one of each id kept,
-    /// instances counted. Also returns the `java.lang.Class` class and, when `keep`, where each kept
-    /// object's copied references start.
-    fn size_objects(&mut self, sizing: Sizing, keep: bool) -> (ObjectTable, u32, Column<u64>) {
+    /// instances counted. Also returns the `java.lang.Class` class, where each kept object's copied
+    /// references start when `keep`, and the primitive arrays' hashes by object index.
+    fn size_objects(&mut self, sizing: Sizing, keep: bool) -> (ObjectTable, u32, Column<u64>, ArrayHashes) {
         // Class objects live in the object table too: statics are edges and
         // sticky-class roots point at them.
         let class_class = class_named(&self.classes, "java.lang.Class")
@@ -561,14 +622,23 @@ impl Indexer {
         let capacity = records.len() + class_objects.len();
         let mut table = ObjectTable::new(&self.classes, sizing, capacity);
         let mut starts = Column::with_capacity(if keep { capacity } else { 0 });
+        let hashes = std::mem::replace(&mut self.hashes, Column::with_capacity(0));
+        let mut array_hashes = ArrayHashes {
+            objects: Column::with_capacity(hashes.len()),
+            values: Column::with_capacity(hashes.len()),
+        };
         let mut last = None;
         let mut instances = vec![0u64; self.classes.len()];
         merge_runs(&mut runs, |record| {
             if last != Some(record[0]) {
                 last = Some(record[0]);
-                let class = raw_class(record);
+                let (class, kind) = (raw_class(record), raw_kind(record));
                 instances[class as usize] += 1;
-                table.push(record[0], class, raw_kind(record), record[1] as u32);
+                if kind == Kind::PrimitiveArray {
+                    array_hashes.objects.push(table.len() as u32);
+                    array_hashes.values.push(hashes[record[2] as usize]);
+                }
+                table.push(record[0], class, kind, record[1] as u32);
                 if keep {
                     starts.push(record[2]);
                 }
@@ -577,7 +647,7 @@ impl Indexer {
         for (class, count) in self.classes.iter_mut().zip(instances) {
             class.instances = count;
         }
-        (table, class_class, starts)
+        (table, class_class, starts, array_hashes)
     }
 }
 

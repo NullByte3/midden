@@ -185,6 +185,13 @@ impl ObjectTable {
     }
 }
 
+/// Both hashes of every primitive array, by object index, as the index pass took them: the String hash
+/// (zero when not taken) and the grouping hash.
+pub struct ArrayHashes {
+    pub objects: Column<u32>,
+    pub values: Column<[u64; 2]>,
+}
+
 pub struct Field {
     pub name: u32,
     pub ty: Ty,
@@ -300,6 +307,9 @@ pub struct Dump {
     pub symbols: FastMap<u64, String>,
     pub classes: Vec<Class>,
     pub objects: ObjectTable,
+    /// Primitive array hashes and boxed value tallies from the index pass; `None` when it did not take them.
+    pub array_hashes: Option<ArrayHashes>,
+    pub boxed_values: Option<FastMap<(u32, u64), u64>>,
     pub roots: Vec<(u32, Root)>,
     pub dangling_roots: u64,
     /// Objects ART marked unreachable: counted, never roots.
@@ -356,6 +366,48 @@ impl Buckets {
         let (lo, hi) = (self.starts[bucket] as usize, self.starts[bucket + 1] as usize);
         ids[lo..hi].binary_search(&id).ok().map(|i| (lo + i) as u32)
     }
+}
+
+/// The class with exactly this name that has a layout, else any with the name.
+pub fn class_named(classes: &[Class], name: &str) -> Option<u32> {
+    let named = |class: &Class| class.name == name;
+    let dumped = classes.iter().position(|class| named(class) && class.dumped);
+    dumped.or_else(|| classes.iter().position(named)).map(|i| i as u32)
+}
+
+/// A class and its superclasses, nearest first.
+pub fn ancestry(classes: &[Class], class: u32) -> impl Iterator<Item = u32> + '_ {
+    let known = |class: u32| (class != NONE).then_some(class);
+    std::iter::successors(known(class), move |&current| known(classes[current as usize].superclass))
+        .take(MAX_CLASS_DEPTH)
+}
+
+/// Instance field layout for `class`: `(name, type, offset)` up the chain.
+pub fn field_layout(classes: &[Class], id_size: u32, class: u32) -> Vec<(u32, Ty, u32)> {
+    let mut out = Vec::new();
+    let mut offset = 0u32;
+    for ancestor in ancestry(classes, class) {
+        for field in &classes[ancestor as usize].fields {
+            out.push((field.name, field.ty, offset));
+            offset += field.ty.size(id_size);
+        }
+    }
+    out
+}
+
+/// Offset and type of the instance field called `name`, if `class` has one.
+pub fn field_offset(
+    classes: &[Class],
+    names: &[String],
+    id_size: u32,
+    class: u32,
+    name: &str,
+) -> Option<(u32, Ty)> {
+    let id = names.iter().position(|interned| interned == name)? as u32;
+    field_layout(classes, id_size, class)
+        .into_iter()
+        .find(|&(field_id, _, _)| field_id == id)
+        .map(|(_, ty, offset)| (offset, ty))
 }
 
 /// `java/util/Map$Entry`, `[I`, `[Ljava/lang/String;` as source spells them.
@@ -422,9 +474,7 @@ impl Dump {
 
     /// The class with exactly this name that has a layout, else any with the name.
     pub fn class_named(&self, name: &str) -> Option<u32> {
-        let named = |class: &Class| class.name == name;
-        let dumped = self.classes.iter().position(|class| named(class) && class.dumped);
-        dumped.or_else(|| self.classes.iter().position(named)).map(|i| i as u32)
+        class_named(&self.classes, name)
     }
 
     /// Whether `class` is `base` or extends it.
@@ -434,9 +484,7 @@ impl Dump {
 
     /// A class and its superclasses, nearest first.
     pub fn ancestry(&self, class: u32) -> impl Iterator<Item = u32> + '_ {
-        let known = |class: u32| (class != NONE).then_some(class);
-        std::iter::successors(known(class), move |&current| known(self.classes[current as usize].superclass))
-            .take(MAX_CLASS_DEPTH)
+        ancestry(&self.classes, class)
     }
 
     /// Index of an interned field name.
@@ -446,24 +494,12 @@ impl Dump {
 
     /// Instance field layout for `class`: `(name, type, offset)` up the chain.
     pub fn field_layout(&self, class: u32) -> Vec<(u32, Ty, u32)> {
-        let mut out = Vec::new();
-        let mut offset = 0u32;
-        for ancestor in self.ancestry(class) {
-            for field in &self.classes[ancestor as usize].fields {
-                out.push((field.name, field.ty, offset));
-                offset += field.ty.size(self.header.id_size);
-            }
-        }
-        out
+        field_layout(&self.classes, self.header.id_size, class)
     }
 
     /// Offset and type of the instance field called `name`, if `class` has one.
     pub fn field_offset(&self, class: u32, name: &str) -> Option<(u32, Ty)> {
-        let id = self.name_id(name)?;
-        self.field_layout(class)
-            .into_iter()
-            .find(|&(field_id, _, _)| field_id == id)
-            .map(|(_, ty, offset)| (offset, ty))
+        field_offset(&self.classes, &self.names, self.header.id_size, class, name)
     }
 
     /// The label a class-object edge carries for its `k`-th static field.

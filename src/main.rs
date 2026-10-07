@@ -324,14 +324,20 @@ fn read_details(heap: &Heap, source: &Source, view: &View) -> Result<Details> {
     }
     let shows = |section: Section| view.sections.has(section) && !view.focused();
     let mut arrays = Vec::new();
+    // Hashes and boxed tallies the index pass took are used as they are; only a String's array past its
+    // limit is hashed by this read.
+    let mut known = Vec::new();
     if view.sections.needs_hashes() && !view.focused() {
-        request.hash = strings.iter().map(|&(_, array)| dump.objects.id(array as usize)).collect();
+        let (taken, missing) = known_hashes(dump, strings.iter().map(|&(_, array)| array), 0);
+        (known, request.hash) = (taken, missing);
     }
     if shows(Section::Arrays) {
         arrays = heap.hashable_arrays(&strings);
-        request.content = arrays.iter().map(|&array| dump.objects.id(array as usize)).collect();
+        let (taken, missing) = known_hashes(dump, arrays.iter().copied(), 1);
+        known.extend(taken);
+        request.content = missing;
     }
-    if shows(Section::Boxed) {
+    if shows(Section::Boxed) && dump.boxed_values.is_none() {
         request.boxed = heap
             .boxed_classes()
             .into_iter()
@@ -341,7 +347,15 @@ fn read_details(heap: &Heap, source: &Source, view: &View) -> Result<Details> {
     let buffers = if shows(Section::Direct) { heap.direct_buffers() } else { Vec::new() };
     request.want.extend(heap.direct_wants(&buffers));
     add_search(heap, &strings, &mut request, view.find.as_deref(), view.filter.as_deref())?;
-    let fetched = detail::fetch(source, dump, request)?;
+    let mut fetched = detail::fetch(source, dump, request)?;
+    if !known.is_empty() {
+        known.extend(fetched.hashed.iter().copied().zip(fetched.hashes.iter().copied()));
+        known.sort_by_key(|&(id, _)| id);
+        (fetched.hashed, fetched.hashes) = known.into_iter().unzip();
+    }
+    if let Some(boxed) = dump.boxed_values.as_ref().filter(|_| shows(Section::Boxed)) {
+        fetched.boxed.clone_from(boxed);
+    }
 
     let names = dump
         .threads
@@ -367,6 +381,30 @@ fn read_details(heap: &Heap, source: &Source, view: &View) -> Result<Details> {
         inputs.direct = Some(heap.direct(&buffers, &fetched));
     }
     Ok(Details { strings, fetched, names, inputs })
+}
+
+/// Split the arrays to hash into the hashes the index pass took, `(id, hash)` with `which` 0 for the String
+/// hash and 1 for the grouping one, and the ids it did not hash.
+fn known_hashes(
+    dump: &dump::Dump,
+    arrays: impl Iterator<Item = u32>,
+    which: usize,
+) -> (Vec<(u64, u64)>, Vec<u64>) {
+    let mut arrays: Vec<u32> = arrays.collect();
+    arrays.sort_unstable();
+    arrays.dedup();
+    let id = |array: u32| dump.objects.id(array as usize);
+    let Some(table) = &dump.array_hashes else { return (Vec::new(), arrays.into_iter().map(id).collect()) };
+    let (mut known, mut missing) = (Vec::new(), Vec::new());
+    let mut at = 0;
+    for array in arrays {
+        at += table.objects[at..].partition_point(|&object| object < array);
+        match table.objects.get(at).filter(|&&object| object == array).map(|_| table.values[at][which]) {
+            Some(hash) if hash != 0 => known.push((id(array), hash)),
+            _ => missing.push(id(array)),
+        }
+    }
+    (known, missing)
 }
 
 /// Add `--find` / `--where` to a request.

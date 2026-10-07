@@ -2,7 +2,7 @@
 //! contents, and boxed primitives holding the same value.
 
 use super::Heap;
-use crate::dump::{FastMap, Kind};
+use crate::dump::{self, Class, FastMap, Kind};
 use crate::hprof::Ty;
 use crate::parallel;
 
@@ -59,6 +59,20 @@ const BOXED: [(&str, Ty); 8] = [
     ("java.lang.Float", Ty::Float),
     ("java.lang.Double", Ty::Double),
 ];
+
+/// The boxed classes among `classes`: `(class, class id, value offset, type)`. The index pass tallies
+/// their values with this too.
+pub fn boxed_classes(classes: &[Class], names: &[String], id_size: u32) -> Vec<(u32, u64, u32, Ty)> {
+    BOXED
+        .iter()
+        .filter_map(|&(name, ty)| {
+            let class = dump::class_named(classes, name)?;
+            let (offset, field_ty) =
+                dump::field_offset(classes, names, id_size, class, "value").filter(|field| field.1 == ty)?;
+            Some((class, classes[class as usize].id, offset, field_ty))
+        })
+        .collect()
+}
 
 impl Heap<'_> {
     /// Group Strings by the content of their backing arrays.
@@ -138,15 +152,7 @@ impl Heap<'_> {
 
     /// The boxed classes present: `(class, class id, value offset, type)`.
     pub fn boxed_classes(&self) -> Vec<(u32, u64, u32, Ty)> {
-        let dump = self.dump;
-        BOXED
-            .iter()
-            .filter_map(|&(name, ty)| {
-                let class = dump.class_named(name)?;
-                let (offset, field_ty) = dump.field_offset(class, "value").filter(|field| field.1 == ty)?;
-                Some((class, dump.classes[class as usize].id, offset, field_ty))
-            })
-            .collect()
+        boxed_classes(&self.dump.classes, &self.dump.names, self.dump.header.id_size)
     }
 
     /// Boxed duplicates from the tallies the detail pass made.
