@@ -67,37 +67,52 @@ struct Labels {
     codes: Column<u16>,
     fields: Vec<u32>,
     escapes: Vec<(u64, u32)>,
+    /// Per field name, then the loader: its code, or all ones.
+    code_of: Vec<u16>,
+    names: usize,
 }
 
 impl Labels {
-    /// Code the labels of the edges `offsets` lays out. Field labels are below `names`, or `LOADER`.
+    /// Code the labels of the edges `offsets` lays out, each object's from its offset to the next.
     // Takes the plain labels so they are freed once coded.
     #[allow(clippy::needless_pass_by_value)]
-    fn new(offsets: &Offsets, labels: Column<u32>, names: usize) -> Labels {
+    fn new(offsets: &[u64], labels: Column<u32>, dump: &Dump) -> Labels {
+        let names = dump.names.len();
         let slot = |label: u32| match label {
             LOADER => names,
             label if (label as usize) < names => label as usize,
             _ => names + 1,
         };
-        let counts = parallel::ranges(labels.len(), |lo, hi| {
-            let mut counts = vec![0u64; names + 2];
-            for &label in labels[lo..hi].iter().filter(|&&label| label & ARRAY_ELEMENT == 0) {
-                counts[slot(label)] += 1;
+        // The fields the classes name: when they fit the codes, each gets one; else the most used do.
+        let mut listed = vec![false; names + 2];
+        listed[names] = true;
+        for class in &dump.classes {
+            for slot in &class.slots {
+                listed[(slot.label as usize).min(names + 1)] = true;
             }
-            counts
-        });
-        let mut used: Vec<(u64, u32)> = (0..=names)
-            .map(|at| {
-                (
-                    counts.iter().map(|part| part[at]).sum::<u64>(),
-                    if at == names { LOADER } else { at as u32 },
-                )
-            })
-            .filter(|&(count, _)| count > 0)
-            .collect();
-        used.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-        used.truncate(usize::from(ESCAPED));
-        let fields: Vec<u32> = used.iter().map(|&(_, label)| label).collect();
+            for field in class.statics.iter().filter(|field| field.ty == Ty::Object) {
+                listed[(field.name as usize).min(names + 1)] = true;
+            }
+        }
+        listed[names + 1] = false;
+        let label_at = |at: usize| if at == names { LOADER } else { at as u32 };
+        let mut fields: Vec<u32> = (0..=names).filter(|&at| listed[at]).map(label_at).collect();
+        if fields.len() > usize::from(ESCAPED) {
+            let counts = parallel::ranges(labels.len(), |lo, hi| {
+                let mut counts = vec![0u64; names + 2];
+                for &label in labels[lo..hi].iter().filter(|&&label| label & ARRAY_ELEMENT == 0) {
+                    counts[slot(label)] += 1;
+                }
+                counts
+            });
+            let mut used: Vec<(u64, u32)> = (0..=names)
+                .map(|at| (counts.iter().map(|part| part[at]).sum::<u64>(), label_at(at)))
+                .filter(|&(count, _)| count > 0)
+                .collect();
+            used.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+            used.truncate(usize::from(ESCAPED));
+            fields = used.iter().map(|&(_, label)| label).collect();
+        }
         let mut code_of = vec![ESCAPED; names + 2];
         for (code, &label) in fields.iter().enumerate() {
             code_of[slot(label)] = code as u16;
@@ -110,7 +125,7 @@ impl Labels {
         let mut tasks = Vec::new();
         for lo in (0..objects).step_by(per) {
             let hi = (lo + per).min(objects);
-            let (start, end) = (offsets.get(lo), offsets.get(hi));
+            let (start, end) = (offsets[lo], offsets[hi]);
             let (part, tail) = std::mem::take(&mut rest).split_at_mut((end - start) as usize);
             rest = tail;
             let (labels, code_of) = (&labels, &code_of);
@@ -118,7 +133,7 @@ impl Labels {
                 let mut escapes = Vec::new();
                 for object in lo..hi {
                     let mut previous: Option<u32> = None;
-                    for edge in offsets.get(object)..offsets.get(object + 1) {
+                    for edge in offsets[object]..offsets[object + 1] {
                         let label = labels[edge as usize];
                         let code = if label & ARRAY_ELEMENT == 0 {
                             code_of[slot(label)]
@@ -138,7 +153,16 @@ impl Labels {
             });
         }
         let escapes = parallel::run_all(tasks).concat();
-        Labels { codes, fields, escapes }
+        Labels { codes, fields, escapes, code_of, names }
+    }
+
+    /// The code of a field label, when it has one.
+    fn code(&self, label: u32) -> Option<u16> {
+        let at = match label {
+            LOADER => self.names,
+            label => (label as usize).min(self.names + 1),
+        };
+        self.code_of.get(at).copied().filter(|&code| code != ESCAPED)
     }
 }
 
@@ -235,7 +259,12 @@ impl<'a> Edges<'a> {
         self.targets().zip(self.labels())
     }
 
-    /// `(target, label)` pairs with every element's label just `ARRAY_ELEMENT`: no gaps to add up.
+    /// Edge `k`'s field label, or just `ARRAY_ELEMENT` for an element: no gaps to add up.
+    pub fn coarse(&self, k: usize) -> u32 {
+        self.labels.coarse(k)
+    }
+
+    /// `(target, label)` pairs with every element's label just `ARRAY_ELEMENT`.
     pub fn iter_coarse(&self) -> impl Iterator<Item = (u32, u32)> + use<'a> {
         let labels = self.labels;
         self.targets().enumerate().map(move |(k, target)| (target, labels.coarse(k)))
@@ -288,10 +317,13 @@ impl Graph {
 
     /// The target of `object`'s edge labelled `label`.
     pub fn field(&self, object: u32, label: u32) -> Option<u32> {
-        self.edges(object)
-            .iter_coarse()
-            .find(|&(_, edge_label)| edge_label == label)
-            .map(|(target, _)| target)
+        let edges = self.edges(object);
+        match self.labels.code(label) {
+            Some(code) => edges.labels.codes.iter().position(|&at| at == code).map(|k| edges.targets[k]),
+            None => {
+                edges.iter_coarse().find(|&(_, edge_label)| edge_label == label).map(|(target, _)| target)
+            }
+        }
     }
 
     /// The referent of a Reference object, weak or strong.
@@ -299,26 +331,19 @@ impl Graph {
         self.field(object, referent_label).or_else(|| self.weak_referents(object).next())
     }
 
-    /// Reassemble a graph from cached parts; field labels are below `names`, or `LOADER`.
+    /// Reassemble a graph from cached parts.
     pub fn from_parts(
         offsets: Column<u64>,
         targets: Column<u32>,
         labels: Column<u32>,
-        names: usize,
+        dump: &Dump,
         weak: Vec<(u32, u32)>,
         dangling: u64,
         roots: Vec<u32>,
     ) -> Graph {
+        let labels = Labels::new(&offsets, labels, dump);
         let offsets = Offsets::new(offsets);
-        Graph {
-            root: offsets.len() as u32 - 1,
-            labels: Labels::new(&offsets, labels, names),
-            offsets,
-            targets,
-            weak,
-            dangling,
-            roots,
-        }
+        Graph { root: offsets.len() as u32 - 1, labels, offsets, targets, weak, dangling, roots }
     }
 
     /// The parts the cache writes.
@@ -446,8 +471,8 @@ pub fn build(
     if !holes {
         let (mut targets, labels) = (target_column, label_column);
         parallel::chunks(&mut targets, |_, part| part.iter_mut().for_each(|target| *target -= 1));
+        let labels = Labels::new(&offsets, labels, dump);
         let offsets = Offsets::new(offsets);
-        let labels = Labels::new(&offsets, labels, dump.names.len());
         return Ok(Graph { root: object_count as u32, offsets, targets, labels, weak, dangling, roots });
     }
 
@@ -486,8 +511,8 @@ pub fn build(
     targets.shrink_to_fit();
     labels.shrink_to_fit();
     drop(offsets);
+    let labels = Labels::new(&packed, labels, dump);
     let offsets = Offsets::new(packed);
-    let labels = Labels::new(&offsets, labels, dump.names.len());
     Ok(Graph { root: object_count as u32, offsets, targets, labels, weak, dangling, roots })
 }
 

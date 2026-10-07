@@ -129,7 +129,7 @@ impl<T> Extend<T> for Column<T> {
 }
 
 /// Values per base in a [`Blocked`] column.
-pub const BLOCK: usize = 64;
+pub const BLOCK: usize = 256;
 
 /// Ascending values in two bytes each above a base every [`BLOCK`] of them. One too far above its base
 /// is all ones there and kept whole in `long`, by index.

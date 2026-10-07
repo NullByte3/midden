@@ -95,10 +95,10 @@ impl Kind {
     pub const ALL: [Kind; 4] = [Kind::Instance, Kind::ObjectArray, Kind::PrimitiveArray, Kind::Class];
 }
 
-/// One heap object. `len` is the elements of an array, zero for anything else.
+/// One heap object, but for its id, which takes a lookup of its own. `len` is the elements of an array,
+/// zero for anything else.
 #[derive(Clone, Copy, Debug)]
 pub struct Object {
-    pub id: u64,
     pub class: u32,
     pub len: u32,
     pub shallow: u32,
@@ -126,29 +126,28 @@ impl TableIds {
 /// How a shape word splits: the kind in the low bits, `class_bits` of class, then the length.
 #[derive(Clone, Copy)]
 pub struct Packing {
-    class_bits: u32,
+    class_mask: u32,
+    len_shift: u32,
+    /// All ones in the length bits: the length is in the long list.
+    marker: u32,
 }
 
 impl Packing {
     /// Room for classes `0..classes`.
     pub fn new(classes: usize) -> Packing {
-        Packing { class_bits: usize::BITS - classes.saturating_sub(1).leading_zeros() }
-    }
-
-    fn len_shift(self) -> u32 {
-        KIND_BITS + self.class_bits
-    }
-
-    /// All ones in the length bits: the length is in the long list.
-    fn marker(self) -> u32 {
-        u32::MAX.checked_shr(self.len_shift()).unwrap_or(0)
+        let class_bits = usize::BITS - classes.saturating_sub(1).leading_zeros();
+        let len_shift = KIND_BITS + class_bits;
+        Packing {
+            class_mask: ((1u64 << class_bits) - 1) as u32,
+            len_shift,
+            marker: u32::MAX.checked_shr(len_shift).unwrap_or(0),
+        }
     }
 
     /// One object's word, and its length again when that goes in the long list.
     pub fn pack(self, class: u32, kind: Kind, len: u32) -> (u32, Option<u32>) {
-        let marker = self.marker();
-        let inline = len.min(marker).checked_shl(self.len_shift()).unwrap_or(0);
-        (inline | class << KIND_BITS | kind as u32, (len >= marker && len != 0).then_some(len))
+        let inline = len.min(self.marker).checked_shl(self.len_shift).unwrap_or(0);
+        (inline | class << KIND_BITS | kind as u32, (len >= self.marker && len != 0).then_some(len))
     }
 }
 
@@ -175,7 +174,7 @@ impl Shapes {
     }
 
     fn class(&self, word: u32) -> u32 {
-        ((u64::from(word) >> KIND_BITS) & ((1 << self.packing.class_bits) - 1)) as u32
+        (word >> KIND_BITS) & self.packing.class_mask
     }
 
     fn kind(word: u32) -> Kind {
@@ -183,8 +182,8 @@ impl Shapes {
     }
 
     fn len(&self, object: usize, word: u32) -> u32 {
-        let inline = (u64::from(word) >> self.packing.len_shift()) as u32;
-        if inline != self.packing.marker() {
+        let inline = word.checked_shr(self.packing.len_shift).unwrap_or(0);
+        if inline != self.packing.marker {
             return inline;
         }
         let found = self.long.binary_search_by_key(&(object as u32), |&(object, _)| object);
@@ -331,13 +330,7 @@ impl ObjectTable {
             Kind::ObjectArray | Kind::PrimitiveArray => self.shapes.len(object, word),
             Kind::Instance | Kind::Class => 0,
         };
-        Object {
-            id: self.id(object),
-            class: self.shapes.class(word),
-            len,
-            shallow: self.shallow_of(object, word),
-            kind,
-        }
+        Object { class: self.shapes.class(word), len, shallow: self.shallow_of(object, word), kind }
     }
 
     /// Objects `start..end`, in order.
@@ -525,10 +518,8 @@ fn step_of(base: u64, id: u64) -> Option<u32> {
     u32::try_from(distance >> 3).ok()
 }
 
-/// Buckets widen until the id span needs at most this many.
+/// Buckets widen until the id span needs at most this many, or as many as there are objects.
 const MAX_BUCKETS: u64 = 1 << 22;
-/// Objects a bucket holds on average, at least.
-const OBJECTS_PER_BUCKET: u64 = 4;
 
 /// The object table bucketed by address range: a short binary search per id, not a hash lookup.
 struct Buckets {
@@ -547,7 +538,7 @@ impl Buckets {
         let Some(last) = table.len().checked_sub(1) else { return Buckets::empty() };
         let (min, max) = (table.id(0), table.id(last));
         let span = max - min + 1;
-        let limit = (table.len() as u64 / OBJECTS_PER_BUCKET).clamp(1, MAX_BUCKETS);
+        let limit = (table.len() as u64).clamp(1, MAX_BUCKETS);
         let mut shift = 0;
         while (span >> shift) > limit {
             shift += 1;

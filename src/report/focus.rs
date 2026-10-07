@@ -120,7 +120,7 @@ impl Render<'_, '_> {
                 self.percent(heap.retained(object))
             ),
         );
-        let raw = self.fetched.raw.get(&record.id);
+        let raw = self.fetched.raw.get(&heap.dump.objects.id(object as usize));
         match record.kind {
             Kind::Instance | Kind::Class => {
                 self.dim_line(out, "fields");

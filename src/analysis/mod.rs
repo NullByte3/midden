@@ -368,8 +368,10 @@ impl<'a> Heap<'a> {
                     Some(&class) => (class, STATIC),
                     None => (record.class, 0),
                 };
-                for (target, label) in graph.edges(source).iter_coarse() {
+                let edges = graph.edges(source);
+                for (k, target) in edges.targets().enumerate() {
                     if let Some(index) = slot(target) {
+                        let label = edges.coarse(k);
                         while counts.len() <= index {
                             counts.push(FastMap::default());
                         }

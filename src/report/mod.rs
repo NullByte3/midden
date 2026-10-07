@@ -532,16 +532,17 @@ impl Render<'_, '_> {
     /// their length, strings with their text, class objects by class.
     fn describe(&self, object: u32) -> String {
         let (dump, record) = (self.heap.dump, self.heap.dump.objects.get(object as usize));
+        let id = dump.objects.id(object as usize);
         let name = &dump.classes[record.class as usize].name;
         match record.kind {
-            Kind::Class => format!("{} @0x{:x}", self.heap.kind_text(object), record.id),
+            Kind::Class => format!("{} @0x{id:x}", self.heap.kind_text(object)),
             Kind::ObjectArray | Kind::PrimitiveArray => {
                 let base = name.strip_suffix("[]").unwrap_or(name);
-                format!("{base}[{}] @0x{:x}", commas(u64::from(record.len)), record.id)
+                format!("{base}[{}] @0x{id:x}", commas(u64::from(record.len)))
             }
             Kind::Instance => match self.text(object) {
-                Some(text) => format!("{name} \"{text}\" @0x{:x}", record.id),
-                None => format!("{name} @0x{:x}", record.id),
+                Some(text) => format!("{name} \"{text}\" @0x{id:x}"),
+                None => format!("{name} @0x{id:x}"),
             },
         }
     }

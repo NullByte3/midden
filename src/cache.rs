@@ -493,6 +493,6 @@ fn read(mut reader: Reader, key: &Key, dump_path: &str) -> io::Result<(Dump, Gra
         value_label,
         name_label,
     };
-    let names = dump.names.len();
-    Ok((dump, Graph::from_parts(offsets, targets, labels, names, weak, dangling, graph_roots)))
+    let graph = Graph::from_parts(offsets, targets, labels, &dump, weak, dangling, graph_roots);
+    Ok((dump, graph))
 }
