@@ -7,7 +7,7 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use super::dump::{
-    ArrayHashes, Class, Dump, FastMap, Field, ObjectTable, RefKind, Slot, Static, Thread, Trace,
+    ArrayHashes, Class, Dump, FastMap, Field, ObjectTable, RefKind, Slot, Static, Symbols, Thread, Trace,
 };
 use super::graph::{Graph, ReferencePolicy};
 use super::hash::{FNV_OFFSET_BASIS, FNV_PRIME};
@@ -16,7 +16,7 @@ use super::sizes::{SizeMode, Sizing};
 use super::store::Column;
 
 const MAGIC: &[u8; 8] = b"CTDLHEAP";
-const VERSION: u32 = 7;
+const VERSION: u32 = 8;
 /// Spreads each key field before the next is folded in. Part of the file name: never change.
 const KEY_ROTATION: u32 = 17;
 /// Written for a class that is no Reference; reads back as None.
@@ -213,8 +213,8 @@ pub fn save(path: &Path, key: &Key, dump: &Dump, graph: &Graph) -> io::Result<()
         writer.str(name)?;
     }
     writer.count(dump.symbols.len())?;
-    for (id, symbol) in &dump.symbols {
-        writer.u64(*id)?;
+    for (id, symbol) in dump.symbols.iter() {
+        writer.u64(id)?;
         writer.str(symbol)?;
     }
     writer.count(dump.classes.len())?;
@@ -303,14 +303,13 @@ pub fn save(path: &Path, key: &Key, dump: &Dump, graph: &Graph) -> io::Result<()
     // What the index pass took for the detail read, so a cached load need not read the dump for it.
     writer.u8(u8::from(dump.array_hashes.is_some()))?;
     if let Some(hashes) = &dump.array_hashes {
-        writer.u32s(hashes.objects.len(), hashes.objects.iter().copied())?;
         let pair = |&[string, content]: &[u64; 2]| {
             let mut bytes = [0u8; 16];
             bytes[..8].copy_from_slice(&string.to_le_bytes());
             bytes[8..].copy_from_slice(&content.to_le_bytes());
             bytes
         };
-        writer.bytes(hashes.values.len(), hashes.values.iter().map(pair))?;
+        writer.bytes(hashes.values().len(), hashes.values().iter().map(pair))?;
     }
     writer.u8(u8::from(dump.boxed_values.is_some()))?;
     if let Some(boxed) = &dump.boxed_values {
@@ -362,8 +361,11 @@ fn read(mut reader: Reader, key: &Key, dump_path: &str) -> io::Result<(Dump, Gra
         .map(|piece| Piece { start: piece[0], end: piece[1], min: piece[2], max: piece[3] })
         .collect();
     let names: Vec<String> = (0..reader.u32()?).map(|_| reader.str()).collect::<io::Result<_>>()?;
-    let symbols: FastMap<u64, String> =
-        (0..reader.u32()?).map(|_| Ok((reader.u64()?, reader.str()?))).collect::<io::Result<_>>()?;
+    let mut symbols = Symbols::default();
+    for _ in 0..reader.u32()? {
+        let id = reader.u64()?;
+        symbols.insert(id, reader.str()?.as_bytes());
+    }
     let ty_from_tag = |tag: u8| Ty::from_tag(tag).ok_or_else(invalid);
     let mut classes = Vec::new();
     for _ in 0..reader.u32()? {
@@ -435,7 +437,6 @@ fn read(mut reader: Reader, key: &Key, dump_path: &str) -> io::Result<(Dump, Gra
     let array_hashes = if reader.u8()? == 0 {
         None
     } else {
-        let objects = reader.u32s()?;
         let values = reader.column(|bytes: [u8; 16]| {
             let (string, content) = bytes.split_at(8);
             [
@@ -443,10 +444,7 @@ fn read(mut reader: Reader, key: &Key, dump_path: &str) -> io::Result<(Dump, Gra
                 u64::from_le_bytes(content.try_into().unwrap_or_default()),
             ]
         })?;
-        if values.len() != objects.len() {
-            return Err(invalid());
-        }
-        Some(ArrayHashes { objects, values })
+        Some(values)
     };
     let boxed_values = if reader.u8()? == 0 {
         None
@@ -464,6 +462,10 @@ fn read(mut reader: Reader, key: &Key, dump_path: &str) -> io::Result<(Dump, Gra
     }
     let objects = ObjectTable::from_columns(&classes, sizing, &ids, shapes);
     drop(ids);
+    let array_hashes = match array_hashes {
+        Some(values) => Some(ArrayHashes::new(&objects, values).ok_or_else(invalid)?),
+        None => None,
+    };
     let dump = Dump {
         path: dump_path.to_string(),
         file_size,

@@ -414,6 +414,8 @@ pub fn dominators(graph: &Graph, dump: &Dump) -> DominatorTree {
     vertex.push(root);
     parent.push(NONE);
     dfs_number[object_count] = 0;
+    // Vertices not yet numbered, a bit each: the walk tests these, which stay in cache, not the numbers.
+    let mut unvisited = parallel::bits(object_count, |object| graph.edges(object as u32).len() != 0);
     // Each frame: its number, then its next and end edge as places in the target array (the root's
     // edges are its GC roots).
     let targets = graph.all_targets();
@@ -426,17 +428,25 @@ pub fn dominators(graph: &Graph, dump: &Dump) -> DominatorTree {
         }
         frame.1 += 1;
         let successor = if number == 0 { graph.roots[next] } else { targets[next] };
-        if dfs_number[successor as usize] == NONE {
+        if unvisited.take(successor as usize) {
             let successor_number = vertex.len() as u32;
-            dfs_number[successor as usize] = successor_number;
             parent.push(number);
             vertex.push(successor);
             let span = graph.span(successor);
             stack.push((successor_number, span.start, span.end));
         }
     }
-    drop(stack);
+    drop((stack, unvisited));
     let vertex_count = vertex.len();
+    // Numbers go in after the walk, in parallel, keeping a random write out of it.
+    {
+        let numbers = dfs_number.atomics();
+        parallel::ranges(vertex_count - 1, |lo, hi| {
+            for number in (lo + 1)..=hi {
+                numbers[vertex[number] as usize].store(number as u32, Relaxed);
+            }
+        });
+    }
 
     // Predecessors in DFS numbers, in parallel: in-degrees first, then a scatter with a cursor per vertex.
     let number_of = |object: u32| Some(dfs_number[object as usize]).filter(|&number| number != LEAF);
@@ -623,59 +633,67 @@ pub fn dominators(graph: &Graph, dump: &Dump) -> DominatorTree {
         }
     });
     // A preorder in which each subtree is one range: an object takes its dominator's next free place,
-    // and DFS numbers put dominators first. Places go where the dominators were, each read before its
-    // own place is written. Leaves then take what is left of their dominator's range.
+    // and DFS numbers put dominators first. Places go where the dominators were, and next free places
+    // where the sizes were, each read before it is overwritten.
     let reachable = size[0] as usize - 1;
-    let mut next_free = Column::<u32>::zeroed(vertex_count);
     let mut place = dom;
+    let mut free = size;
+    free[0] = 0;
     for number in 1..vertex_count {
-        let dominator = place[number] as usize;
-        place[number] = next_free[dominator];
-        next_free[dominator] += size[number];
-        next_free[number] = place[number] + 1;
+        let (dominator, size) = (place[number] as usize, free[number]);
+        place[number] = free[dominator];
+        free[dominator] += size;
+        free[number] = place[number] + 1;
     }
     let (mut preorder, mut subtree_end) =
         (Column::<u32>::zeroed(reachable), Column::<u32>::zeroed(reachable));
-    dfs_number.truncate(object_count + 1);
     {
-        let (preorder, subtree_end) = (preorder.atomics(), subtree_end.atomics());
-        let (free, numbers) = (next_free.atomics(), dfs_number.atomics());
+        let preorder = preorder.atomics();
         parallel::ranges(vertex_count - 1, |lo, hi| {
             for number in (lo + 1)..=hi {
                 preorder[place[number] as usize].store(vertex[number], Relaxed);
-                subtree_end[place[number] as usize].store(place[number] + size[number], Relaxed);
             }
         });
-        // A leaf's dominator is a vertex, whose entry still holds its number: the leaf writes only its own.
+    }
+    drop((place, vertex));
+    // Leaves take what is left of their dominator's range. A leaf's dominator is a vertex, whose entry
+    // still holds its number.
+    dfs_number.truncate(object_count + 1);
+    {
+        let (preorder, subtree_end) = (preorder.atomics(), subtree_end.atomics());
+        let (free, numbers) = (free.atomics(), dfs_number.atomics());
         parallel::ranges(object_count, |lo, hi| {
             for object in lo..hi {
                 if numbers[object].load(Relaxed) != LEAF {
                     continue;
                 }
-                let at = match idom[object] {
-                    NONE => NONE,
+                match idom[object] {
+                    NONE => numbers[object].store(NONE, Relaxed),
                     dominator => {
                         let at =
                             free[numbers[dominator as usize].load(Relaxed) as usize].fetch_add(1, Relaxed);
                         preorder[at as usize].store(object as u32, Relaxed);
                         subtree_end[at as usize].store(at + 1, Relaxed);
-                        at
                     }
-                };
-                numbers[object].store(at, Relaxed);
+                }
             }
         });
     }
-    // Last, the vertices' DFS numbers become their places.
+    // Last, every placed object's number becomes its place; a vertex's range ends where its next free
+    // place stopped.
     {
         let numbers = dfs_number.atomics();
-        parallel::ranges(vertex_count - 1, |lo, hi| {
-            for number in (lo + 1)..=hi {
-                numbers[vertex[number] as usize].store(place[number], Relaxed);
+        parallel::chunks(&mut subtree_end, |start, part| {
+            for (end, (pos, &object)) in part.iter_mut().zip((start as u32..).zip(&preorder[start..])) {
+                let number = numbers[object as usize].load(Relaxed);
+                if number != LEAF {
+                    *end = free[number as usize];
+                }
+                numbers[object as usize].store(pos, Relaxed);
             }
         });
     }
-    drop((place, next_free, size, vertex));
+    drop(free);
     dfs_number.truncate(object_count);
     let preorder_index = dfs_number;
     let mut tree =

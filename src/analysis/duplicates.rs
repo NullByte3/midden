@@ -5,6 +5,7 @@ use super::Heap;
 use crate::dump::{self, Class, FastMap, Kind};
 use crate::hprof::Ty;
 use crate::parallel;
+use crate::store::Bits;
 
 /// Strings sharing one content.
 pub struct DuplicateGroup {
@@ -74,31 +75,87 @@ pub fn boxed_classes(classes: &[Class], names: &[String], id_size: u32) -> Vec<(
         .collect()
 }
 
-impl Heap<'_> {
-    /// Group Strings by the content of their backing arrays.
-    pub fn duplicates(&self, pairs: &[(u32, u32)], hash_of: impl Fn(u32) -> Option<u64>) -> Duplicates {
-        let mut seen: Vec<(u32, u32)> = pairs.to_vec();
-        seen.sort_unstable_by_key(|pair| (pair.1, pair.0));
-        seen.dedup_by_key(|pair| pair.1);
-        let mut groups: FastMap<u64, (u64, u32, u32, u64)> = FastMap::default();
-        for &(string, array) in &seen {
-            let Some(hash) = hash_of(array) else { continue };
-            let group = groups.entry(hash).or_insert((0, string, array, 0));
-            group.0 += 1;
-            if group.0 > 1 {
-                group.3 += self.shallow(array) + self.shallow(string);
+/// Items sharing one hash: the lowest-ranked of them, how many, and the bytes of all but that one.
+struct HashGroup<T> {
+    hash: u64,
+    first: T,
+    count: u64,
+    wasted: u64,
+}
+
+/// Group `items` by hash over the workers, each taking one share of the hashes.
+fn group_by_hash<T: Copy + Send + Sync>(
+    items: &[T],
+    hash: impl Fn(T) -> Option<u64> + Sync,
+    rank: impl Fn(T) -> u32 + Sync,
+    bytes: impl Fn(T) -> u64 + Sync,
+) -> Vec<HashGroup<T>> {
+    let shares = parallel::threads();
+    let parts = parallel::ranges(items.len(), |lo, hi| {
+        let mut out = vec![Vec::new(); shares];
+        for &item in &items[lo..hi] {
+            if let Some(hash) = hash(item) {
+                out[(hash >> 32) as usize % shares].push((hash, item));
             }
         }
+        out
+    });
+    let share_ids: Vec<usize> = (0..shares).collect();
+    parallel::items(&share_ids, |&share| {
+        let mut groups: FastMap<u64, (T, u64, u64)> = FastMap::default();
+        for &(hash, item) in parts.iter().flat_map(|part| &part[share]) {
+            let group = groups.entry(hash).or_insert((item, 0, 0));
+            if rank(item) < rank(group.0) {
+                group.0 = item;
+            }
+            group.1 += 1;
+            group.2 += bytes(item);
+        }
+        groups
+            .into_iter()
+            .map(|(hash, (first, count, total))| HashGroup {
+                hash,
+                first,
+                count,
+                wasted: total - bytes(first),
+            })
+            .collect::<Vec<_>>()
+    })
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+impl Heap<'_> {
+    /// Group Strings by the content of their backing arrays.
+    pub fn duplicates(
+        &self,
+        pairs: &[(u32, u32)],
+        hash_of: impl Fn(u32) -> Option<u64> + Sync,
+    ) -> Duplicates {
+        // Each array once, with its first String: the pairs come in String order.
+        let mut shared = Bits::new(self.dump.objects.len());
+        let mut seen: Vec<(u32, u32)> = Vec::with_capacity(pairs.len());
+        for &(string, array) in pairs {
+            if !shared.get(array as usize) {
+                shared.set(array as usize);
+                seen.push((string, array));
+            }
+        }
+        drop(shared);
+        let groups = group_by_hash(
+            &seen,
+            |(_, array)| hash_of(array),
+            |(_, array)| array,
+            |(string, array)| self.shallow(array) + self.shallow(string),
+        );
         let distinct = groups.len() as u64;
         let mut out: Vec<DuplicateGroup> = groups
             .into_iter()
-            .filter(|(_, group)| group.0 > 1)
-            .map(|(hash, (count, string, array, wasted))| DuplicateGroup {
-                string,
-                array,
-                hash,
-                count,
-                wasted,
+            .filter(|group| group.count > 1)
+            .map(|group| {
+                let (string, array) = group.first;
+                DuplicateGroup { string, array, hash: group.hash, count: group.count, wasted: group.wasted }
             })
             .collect();
         out.sort_by(|a, b| b.wasted.cmp(&a.wasted).then(a.array.cmp(&b.array)));
@@ -112,9 +169,11 @@ impl Heap<'_> {
 
     /// Reachable primitive arrays of at least `MIN_ARRAY_DATA_BYTES` that no String owns.
     pub fn hashable_arrays(&self, strings: &[(u32, u32)]) -> Vec<u32> {
-        let mut string_arrays: Vec<u32> = strings.iter().map(|&(_, array)| array).collect();
-        string_arrays.sort_unstable();
         let dump = self.dump;
+        let mut string_arrays = Bits::new(dump.objects.len());
+        for &(_, array) in strings {
+            string_arrays.set(array as usize);
+        }
         parallel::ranges(dump.objects.len(), |lo, hi| {
             (lo as u32..hi as u32)
                 .filter(|&object| {
@@ -122,25 +181,25 @@ impl Heap<'_> {
                     record.kind == Kind::PrimitiveArray
                         && record.shallow >= dump.sizing.array_header + MIN_ARRAY_DATA_BYTES
                 })
-                .filter(|&object| self.reachable(object) && string_arrays.binary_search(&object).is_err())
+                .filter(|&object| self.reachable(object) && !string_arrays.get(object as usize))
                 .collect::<Vec<_>>()
         })
         .concat()
     }
 
     /// Group primitive arrays by content.
-    pub fn array_duplicates(&self, arrays: &[u32], hash_of: impl Fn(u32) -> Option<u64>) -> ArrayDuplicates {
-        let mut groups: FastMap<u64, ArrayGroup> = FastMap::default();
-        for &array in arrays {
-            let Some(hash) = hash_of(array) else { continue };
-            let group = groups.entry(hash).or_insert(ArrayGroup { array, count: 0, wasted: 0 });
-            group.count += 1;
-            if group.count > 1 {
-                group.wasted += self.shallow(array);
-            }
-        }
+    pub fn array_duplicates(
+        &self,
+        arrays: &[u32],
+        hash_of: impl Fn(u32) -> Option<u64> + Sync,
+    ) -> ArrayDuplicates {
+        let groups = group_by_hash(arrays, hash_of, |array| array, |array| self.shallow(array));
         let distinct = groups.len() as u64;
-        let mut out: Vec<ArrayGroup> = groups.into_values().filter(|group| group.count > 1).collect();
+        let mut out: Vec<ArrayGroup> = groups
+            .into_iter()
+            .filter(|group| group.count > 1)
+            .map(|group| ArrayGroup { array: group.first, count: group.count, wasted: group.wasted })
+            .collect();
         out.sort_by(|a, b| b.wasted.cmp(&a.wasted).then(a.array.cmp(&b.array)));
         ArrayDuplicates {
             wasted: out.iter().map(|group| group.wasted).sum(),

@@ -7,7 +7,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 use super::hash::GOLDEN_RATIO;
 use super::hprof::{Frame, Header, Piece, Root, Ty, Value};
 use super::sizes::Sizing;
-use super::store::Column;
+use super::store::{Bits, Column};
 
 pub const NONE: u32 = u32::MAX;
 
@@ -44,6 +44,44 @@ impl Hasher for FastHash {
 
 pub type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FastHash>>;
 
+/// Symbol texts back to back in one string, found by id: no allocation per symbol.
+#[derive(Default)]
+pub struct Symbols {
+    text: String,
+    spans: FastMap<u64, (usize, usize)>,
+}
+
+impl Symbols {
+    pub fn insert(&mut self, id: u64, text: &[u8]) {
+        let start = self.text.len();
+        self.text.push_str(&String::from_utf8_lossy(text));
+        self.spans.insert(id, (start, self.text.len()));
+    }
+
+    pub fn get(&self, id: u64) -> Option<&str> {
+        self.spans.get(&id).map(|&(start, end)| &self.text[start..end])
+    }
+
+    pub fn len(&self) -> usize {
+        self.spans.len()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (u64, &str)> {
+        self.spans.iter().map(|(&id, &(start, end))| (id, &self.text[start..end]))
+    }
+
+    /// Only the symbols `keep` names, in a fresh string.
+    pub fn only(&self, keep: impl IntoIterator<Item = u64>) -> Symbols {
+        let mut kept = Symbols::default();
+        for id in keep {
+            if let Some(text) = self.get(id) {
+                kept.insert(id, text.as_bytes());
+            }
+        }
+        kept
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Kind {
@@ -68,18 +106,20 @@ pub struct Object {
 }
 
 /// Class index and kind in one word: the kind in the low bits.
-const KIND_BITS: u32 = 2;
+pub const KIND_BITS: u32 = 2;
 /// Classes the packed word leaves room for.
 pub const MAX_CLASSES: usize = 1 << (u32::BITS - KIND_BITS);
 
 /// The object table, sorted by id, as columns: ids, and class with kind plus length. Shallow sizes are
 /// worked out on read from the class and length; a class object keeps its own in the length slot.
+/// Object ids, ascending: 8-byte steps above the first (the lowest), four bytes each, while every id fits.
+pub enum TableIds {
+    Steps(u64, Column<u32>),
+    Wide(Column<u64>),
+}
+
 pub struct ObjectTable {
-    /// Ids as 8-byte steps above the first (the lowest): four bytes each while every id fits, else `wide`
-    /// holds them whole.
-    steps: Column<u32>,
-    wide: Option<Column<u64>>,
-    base: u64,
+    ids: TableIds,
     lookup: Buckets,
     shapes: Column<[u32; 2]>,
     /// Per class: an instance's shallow size, and an array element's footprint.
@@ -89,12 +129,10 @@ pub struct ObjectTable {
 }
 
 impl ObjectTable {
-    /// A table for these classes and sizes, filled by [`ObjectTable::push`].
-    pub fn new(classes: &[Class], sizing: Sizing, capacity: usize) -> ObjectTable {
+    /// An empty table for these classes and sizes.
+    fn new(classes: &[Class], sizing: Sizing, capacity: usize) -> ObjectTable {
         ObjectTable {
-            steps: Column::with_capacity(capacity),
-            wide: None,
-            base: 0,
+            ids: TableIds::Steps(0, Column::with_capacity(capacity)),
             lookup: Buckets::empty(),
             shapes: Column::with_capacity(capacity),
             instance_shallow: classes.iter().map(|class| class.shallow).collect(),
@@ -104,6 +142,19 @@ impl ObjectTable {
                 .collect(),
             sizing,
         }
+    }
+
+    /// A table from merged columns.
+    pub fn from_steps(
+        classes: &[Class],
+        sizing: Sizing,
+        ids: TableIds,
+        shapes: Column<[u32; 2]>,
+    ) -> ObjectTable {
+        let mut table = ObjectTable::new(classes, sizing, 0);
+        (table.ids, table.shapes) = (ids, shapes);
+        table.index();
+        table
     }
 
     /// A table from cached columns.
@@ -127,39 +178,32 @@ impl ObjectTable {
         &self.shapes
     }
 
-    /// Append an object, ids ascending; `len` is the shallow size for a class object.
-    pub fn push(&mut self, id: u64, class: u32, kind: Kind, len: u32) {
-        self.push_id(id);
-        self.shapes.push([class << KIND_BITS | kind as u32, len]);
-    }
-
     fn push_id(&mut self, id: u64) {
-        if self.steps.is_empty() && self.wide.is_none() {
-            self.base = id;
-        }
-        if let Some(wide) = &mut self.wide {
-            wide.push(id);
-            return;
-        }
-        if let Some(step) = self.step_of(id) {
-            self.steps.push(step);
-        } else {
-            // An id past four bytes of steps: keep them all whole from here on.
-            let mut wide = Column::with_capacity(self.shapes.len() + 1);
-            wide.extend(self.steps.iter().map(|&step| self.base + (u64::from(step) << 3)));
-            wide.push(id);
-            self.steps = Column::with_capacity(0);
-            self.wide = Some(wide);
-        }
-    }
-
-    fn step_of(&self, id: u64) -> Option<u32> {
-        let distance = id.checked_sub(self.base).filter(|distance| distance.trailing_zeros() >= 3)?;
-        u32::try_from(distance >> 3).ok()
+        let wide = match &mut self.ids {
+            TableIds::Wide(wide) => {
+                wide.push(id);
+                return;
+            }
+            TableIds::Steps(base, steps) => {
+                if steps.is_empty() {
+                    *base = id;
+                }
+                if let Some(step) = step_of(*base, id) {
+                    steps.push(step);
+                    return;
+                }
+                // An id past four bytes of steps: keep them all whole from here on.
+                let mut wide = Column::with_capacity(steps.len() + 1);
+                wide.extend(steps.iter().map(|&step| *base + (u64::from(step) << 3)));
+                wide.push(id);
+                wide
+            }
+        };
+        self.ids = TableIds::Wide(wide);
     }
 
     /// Bucket the ids for lookups, once they are all in.
-    pub fn index(&mut self) {
+    fn index(&mut self) {
         self.lookup = Buckets::build(self);
     }
 
@@ -172,18 +216,18 @@ impl ObjectTable {
     }
 
     pub fn id(&self, object: usize) -> u64 {
-        match &self.wide {
-            Some(wide) => wide[object],
-            None => self.base + (u64::from(self.steps[object]) << 3),
+        match &self.ids {
+            TableIds::Steps(base, steps) => base + (u64::from(steps[object]) << 3),
+            TableIds::Wide(wide) => wide[object],
         }
     }
 
     /// The index of the object with this id.
     pub fn lookup(&self, id: u64) -> Option<u32> {
         let (lo, hi) = self.lookup.range(id)?;
-        let found = match &self.wide {
-            Some(wide) => wide[lo..hi].binary_search(&id),
-            None => self.steps[lo..hi].binary_search(&self.step_of(id)?),
+        let found = match &self.ids {
+            TableIds::Steps(base, steps) => steps[lo..hi].binary_search(&step_of(*base, id)?),
+            TableIds::Wide(wide) => wide[lo..hi].binary_search(&id),
         };
         found.ok().map(|i| (lo + i) as u32)
     }
@@ -235,11 +279,39 @@ impl ObjectTable {
     }
 }
 
-/// Both hashes of every primitive array, by object index, as the index pass took them: the String hash
-/// (zero when not taken) and the grouping hash.
+/// Both hashes of every primitive array, in table order, as the index pass took them: the String hash
+/// (zero when not taken) and the grouping hash. A bit per object marks the arrays and a count per 64
+/// objects finds an array's pair.
 pub struct ArrayHashes {
-    pub objects: Column<u32>,
-    pub values: Column<[u64; 2]>,
+    arrays: Bits,
+    before: Column<u32>,
+    values: Column<[u64; 2]>,
+}
+
+impl ArrayHashes {
+    /// One pair per primitive array in `objects`, in order; `None` when the counts disagree.
+    pub fn new(objects: &ObjectTable, values: Column<[u64; 2]>) -> Option<ArrayHashes> {
+        let mut arrays =
+            super::parallel::bits(objects.len(), |object| objects.kind(object) == Kind::PrimitiveArray);
+        let mut before = Column::with_capacity(arrays.words().len());
+        let mut count = 0;
+        for &word in arrays.words().iter() {
+            before.push(count);
+            count += word.count_ones();
+        }
+        (count as usize == values.len()).then_some(ArrayHashes { arrays, before, values })
+    }
+
+    pub fn get(&self, object: u32) -> Option<[u64; 2]> {
+        let (word, bit) = (object as usize / 64, object % 64);
+        let bits = self.arrays.word(word);
+        (bits >> bit & 1 != 0)
+            .then(|| self.values[(self.before[word] + (bits & ((1 << bit) - 1)).count_ones()) as usize])
+    }
+
+    pub fn values(&self) -> &[[u64; 2]] {
+        &self.values
+    }
 }
 
 pub struct Field {
@@ -354,7 +426,7 @@ pub struct Dump {
     pub pieces: Vec<Piece>,
     /// Interned field names, referenced by `Slot::label` and `Field::name`.
     pub names: Vec<String>,
-    pub symbols: FastMap<u64, String>,
+    pub symbols: Symbols,
     pub classes: Vec<Class>,
     pub objects: ObjectTable,
     /// Primitive array hashes and boxed value tallies from the index pass; `None` when it did not take them.
@@ -373,6 +445,12 @@ pub struct Dump {
     pub string_class: u32,
     pub value_label: u32,
     pub name_label: u32,
+}
+
+/// An id's 8-byte steps above `base`, if it is aligned and within four bytes of them.
+fn step_of(base: u64, id: u64) -> Option<u32> {
+    let distance = id.checked_sub(base).filter(|distance| distance.trailing_zeros() >= 3)?;
+    u32::try_from(distance >> 3).ok()
 }
 
 /// Buckets widen until the id span needs at most this many.
@@ -576,8 +654,8 @@ impl Dump {
         let class = self
             .class_by_serial(frame.class_serial)
             .map_or("?", |idx| self.classes[idx as usize].name.as_str());
-        let method = self.symbols.get(&frame.method_id).map_or("?", String::as_str);
-        let source = self.symbols.get(&frame.source_id).map_or("", String::as_str);
+        let method = self.symbols.get(frame.method_id).unwrap_or("?");
+        let source = self.symbols.get(frame.source_id).unwrap_or("");
         let line = match frame.line {
             n if n > 0 => format!(":{n}"),
             -2 => " compiled".to_string(),

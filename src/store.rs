@@ -99,6 +99,23 @@ impl Bits {
         self.words[index / 64] |= 1 << (index % 64);
     }
 
+    /// Clear a bit, saying whether it was set.
+    pub fn take(&mut self, index: usize) -> bool {
+        let (word, bit) = (&mut self.words[index / 64], 1u64 << (index % 64));
+        let was = *word & bit != 0;
+        *word &= !bit;
+        was
+    }
+
+    pub fn word(&self, index: usize) -> u64 {
+        self.words[index]
+    }
+
+    /// The words, 64 indices each, lowest bit first.
+    pub fn words(&mut self) -> &mut [u64] {
+        &mut self.words
+    }
+
     /// The words as atomics, for workers setting bits.
     pub fn atomics(&mut self) -> &[AtomicU64] {
         self.words.atomics()

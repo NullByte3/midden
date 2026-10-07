@@ -426,8 +426,14 @@ impl<'a> Heap<'a> {
             let dominator = self.dominators.idom[object as usize];
             dominator != root && self.class(dominator) == self.class(object)
         };
-        let mut current: Vec<u32> =
-            members.iter().copied().filter(|&object| self.reachable(object) && !same_class(object)).collect();
+        let mut current: Vec<u32> = parallel::ranges(members.len(), |lo, hi| {
+            members[lo..hi]
+                .iter()
+                .copied()
+                .filter(|&object| self.reachable(object) && !same_class(object))
+                .collect::<Vec<_>>()
+        })
+        .concat();
         let mut out = Vec::new();
         for _ in 0..6 {
             // Bytes per owning class, `NONE` standing for the roots.
@@ -453,17 +459,25 @@ impl<'a> Heap<'a> {
             if class == NONE {
                 break;
             }
-            let mut next: Vec<u32> = parallel::ranges(current.len(), |lo, hi| {
+            let next = parallel::ranges(current.len(), |lo, hi| {
                 current[lo..hi]
                     .iter()
                     .map(|&object| self.dominators.idom[object as usize])
                     .filter(|&dominator| dominator != root && self.class(dominator) == class)
                     .collect::<Vec<_>>()
-            })
-            .concat();
-            next.sort_unstable();
-            next.dedup();
-            current = next;
+            });
+            // Each dominator once; the order does not matter to the sums.
+            let mut listed = Bits::new(self.dump.objects.len());
+            current = next
+                .into_iter()
+                .flatten()
+                .filter(|&dominator| {
+                    !listed.get(dominator as usize) && {
+                        listed.set(dominator as usize);
+                        true
+                    }
+                })
+                .collect();
         }
         out
     }

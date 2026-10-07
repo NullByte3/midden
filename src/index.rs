@@ -9,8 +9,8 @@ use std::sync::Arc;
 use super::analysis::duplicates::boxed_classes;
 use super::detail::ArrayHash;
 use super::dump::{
-    self, ArrayHashes, Class, Dump, FastMap, Field, Kind, MAX_CLASS_DEPTH, MAX_CLASSES, NONE, ObjectTable,
-    RefKind, Slot, Static,
+    self, ArrayHashes, Class, Dump, FastMap, Field, KIND_BITS, Kind, MAX_CLASS_DEPTH, MAX_CLASSES, NONE,
+    ObjectTable, RefKind, Slot, Static, Symbols, TableIds,
 };
 use super::graph::LOADER;
 use super::hprof::{
@@ -134,7 +134,7 @@ impl Ids for Vec<u32> {
 
 pub struct Indexer {
     id_size: u32,
-    symbols: FastMap<u64, String>,
+    symbols: Symbols,
     classes: Vec<Class>,
     class_by_id: FastMap<u64, u32>,
     class_by_serial: HashMap<u32, u32>,
@@ -144,6 +144,8 @@ pub struct Indexer {
     name_by_text: HashMap<String, u32>,
     name_by_id: FastMap<u64, u32>,
     objects: Column<Raw>,
+    /// The highest object id met, which picks the size convention.
+    max_id: u64,
     references: Copied<Column<u32>>,
     hashes: Column<[u64; 2]>,
     /// Per class: where a boxed class keeps its value.
@@ -164,7 +166,7 @@ impl Indexer {
     pub fn new(id_size: u32) -> Indexer {
         Indexer {
             id_size,
-            symbols: FastMap::default(),
+            symbols: Symbols::default(),
             classes: Vec::new(),
             class_by_id: FastMap::default(),
             class_by_serial: HashMap::new(),
@@ -173,6 +175,7 @@ impl Indexer {
             name_by_text: HashMap::new(),
             name_by_id: FastMap::default(),
             objects: Column::with_capacity(0),
+            max_id: 0,
             references: Copied::new(Column::with_capacity(0), 0),
             hashes: Column::with_capacity(0),
             boxed: Vec::new(),
@@ -307,6 +310,7 @@ macro_rules! object_callbacks {
                 let copied = (class, &self.classes[class as usize].slots[..], boxed);
                 copy_instance(copied, self.id_size, body, &mut self.references, &mut self.boxed_values)?;
             }
+            self.max_id = self.max_id.max(id);
             self.objects.push(raw(id, class, Kind::Instance, len, start));
             Ok(())
         }
@@ -317,6 +321,7 @@ macro_rules! object_callbacks {
             if self.copies() {
                 copy_elements(self.id_size as usize, body, &mut self.references)?;
             }
+            self.max_id = self.max_id.max(id);
             self.objects.push(raw(id, class, Kind::ObjectArray, len, start));
             Ok(())
         }
@@ -325,6 +330,7 @@ macro_rules! object_callbacks {
             let class = self.primitive_array_class(ty);
             let at = self.hashes.len();
             self.hashes.push(hash_array(ty, len, body)?);
+            self.max_id = self.max_id.max(id);
             self.objects.push(raw(id, class, Kind::PrimitiveArray, len, at));
             Ok(())
         }
@@ -333,11 +339,11 @@ macro_rules! object_callbacks {
 
 impl Sink for Indexer {
     fn utf8(&mut self, id: u64, text: &[u8]) {
-        self.symbols.insert(id, String::from_utf8_lossy(text).into_owned());
+        self.symbols.insert(id, text);
     }
 
     fn load_class(&mut self, serial: u32, id: u64, name_id: u64) {
-        let raw_name = self.symbols.get(&name_id).map_or("", String::as_str);
+        let raw_name = self.symbols.get(name_id).unwrap_or("");
         let name =
             if raw_name.is_empty() { format!("<class 0x{id:x}>") } else { dump::pretty_class_name(raw_name) };
         let element_type = dump::array_element_type(raw_name, &name);
@@ -387,17 +393,24 @@ struct Part<'a> {
     copying: bool,
     class_dumps: Vec<ClassDump>,
     objects: Vec<Raw>,
+    max_id: u64,
     references: Copied<Vec<u32>>,
     hashes: Vec<[u64; 2]>,
     boxed_values: FastMap<(u32, u64), u64>,
     roots: Vec<Root>,
+    last_class: (u64, u32),
 }
 
 impl Part<'_> {
     fn class_index(&mut self, id: u64) -> u32 {
+        if self.last_class.0 == id {
+            return self.last_class.1;
+        }
         let idx = self.class_by_id.get(&id).copied();
         self.missed |= idx.is_none();
-        idx.unwrap_or(NONE)
+        let idx = idx.unwrap_or(NONE);
+        self.last_class = (id, idx);
+        idx
     }
 
     fn primitive_array_class(&mut self, ty: Ty) -> u32 {
@@ -428,6 +441,7 @@ impl Sink for Part<'_> {
 struct Parsed {
     class_dumps: Vec<ClassDump>,
     objects: Vec<Raw>,
+    max_id: u64,
     references: Copied<Vec<u32>>,
     hashes: Vec<[u64; 2]>,
     boxed_values: FastMap<(u32, u64), u64>,
@@ -489,16 +503,19 @@ impl Indexer {
                     copying,
                     class_dumps: Vec::new(),
                     objects: Vec::new(),
+                    max_id: 0,
                     references: Copied::new(Vec::new(), base),
                     hashes: Vec::new(),
                     boxed_values: FastMap::default(),
                     roots: Vec::new(),
+                    last_class: (0, NONE),
                 };
                 let mut part_walked = Walked::default();
                 hprof::heap(&mut reader, Some(end), &mut part, &mut part_walked).ok()?;
                 (!part.missed).then_some(Parsed {
                     class_dumps: part.class_dumps,
                     objects: part.objects,
+                    max_id: part.max_id,
                     references: part.references,
                     hashes: part.hashes,
                     boxed_values: part.boxed_values,
@@ -525,6 +542,7 @@ impl Indexer {
                 for (key, count) in part.boxed_values {
                     *self.boxed_values.entry(key).or_default() += count;
                 }
+                self.max_id = self.max_id.max(part.max_id);
                 self.objects.reserve(part.objects.len());
                 for &record in &part.objects {
                     let base =
@@ -556,21 +574,23 @@ impl Indexer {
     ) -> Result<(Dump, Option<References>)> {
         self.resolve_class_dumps();
         // Class and field names are copied out by now: only stack frames still look symbols up.
-        let framed: HashSet<u64> =
-            self.frames.values().flat_map(|frame| [frame.method_id, frame.source_id]).collect();
-        self.symbols.retain(|id, _| framed.contains(id));
-        self.symbols.shrink_to_fit();
+        self.symbols =
+            self.symbols.only(self.frames.values().flat_map(|frame| [frame.method_id, frame.source_id]));
         let value_label = intern_str(&mut self.names, "value");
         let name_label = intern_str(&mut self.names, "name");
 
         // Sizes depend on the address range.
-        let max_id = self.objects.iter().map(|record| record[0]).max().unwrap_or(0);
-        let sizing = Sizing::resolve(mode, self.id_size, max_id);
-        self.lay_out_classes(&sizing);
+        let sizing = Sizing::resolve(mode, self.id_size, self.max_id);
+        // Fixed layouts only need their sizes for the real convention; a late class dump lays out again.
+        if self.frozen && !self.late {
+            size_classes(&mut self.classes, &sizing);
+        } else {
+            self.lay_out_classes(&sizing);
+        }
         // Starts are four bytes: a walk that copied more ids than that reads the references again.
         let keep = self.frozen && !self.late && self.references.len() < u32::MAX as usize;
-        let (mut objects, class_class, starts, array_hashes) = self.size_objects(sizing, keep);
-        objects.index();
+        let (objects, class_class, starts, array_hashes) = self.size_objects(sizing, keep);
+        let array_hashes = ArrayHashes::new(&objects, array_hashes);
         // u32 indices keep NONE free and the graph root one past the objects; labels stay below LOADER.
         let counts = [
             ("objects", objects.len(), NONE as usize - 1),
@@ -602,7 +622,7 @@ impl Indexer {
             symbols: self.symbols,
             classes: self.classes,
             objects,
-            array_hashes: Some(array_hashes),
+            array_hashes,
             boxed_values: keep.then_some(self.boxed_values),
             roots: Vec::new(),
             dangling_roots: 0,
@@ -650,7 +670,7 @@ impl Indexer {
         if let Some(&label) = self.name_by_id.get(&id) {
             return label;
         }
-        let text = self.symbols.get(&id).cloned().unwrap_or_else(|| format!("<0x{id:x}>"));
+        let text = self.symbols.get(id).map_or_else(|| format!("<0x{id:x}>"), str::to_string);
         let label = if let Some(&label) = self.name_by_text.get(&text) {
             label
         } else {
@@ -675,8 +695,12 @@ impl Indexer {
 
     /// The object table: the walk's records and the class objects merged by id, one of each id kept,
     /// instances counted. Also returns the `java.lang.Class` class, where each kept object's copied
-    /// references start when `keep`, and the primitive arrays' hashes by object index.
-    fn size_objects(&mut self, sizing: Sizing, keep: bool) -> (ObjectTable, u32, Column<u32>, ArrayHashes) {
+    /// references start when `keep`, and the primitive arrays' hashes in table order.
+    fn size_objects(
+        &mut self,
+        sizing: Sizing,
+        keep: bool,
+    ) -> (ObjectTable, u32, Column<u32>, Column<[u64; 2]>) {
         // Class objects live in the object table too: statics are edges and
         // sticky-class roots point at them.
         let class_class = class_named(&self.classes, "java.lang.Class")
@@ -707,56 +731,155 @@ impl Indexer {
         }
         runs.push(&class_objects);
         runs.retain(|run| !run.is_empty());
-        let capacity = records.len() + class_objects.len();
-        let mut table = ObjectTable::new(&self.classes, sizing, capacity);
-        let mut starts = Column::with_capacity(if keep { capacity } else { 0 });
         let hashes = std::mem::replace(&mut self.hashes, Column::with_capacity(0));
-        let mut array_hashes = ArrayHashes {
-            objects: Column::with_capacity(hashes.len()),
-            values: Column::with_capacity(hashes.len()),
-        };
-        let mut last = None;
-        let mut instances = vec![0u64; self.classes.len()];
-        merge_runs(&mut runs, |record| {
-            if last != Some(record[0]) {
-                last = Some(record[0]);
-                let (class, kind) = (raw_class(record), raw_kind(record));
-                instances[class as usize] += 1;
-                if kind == Kind::PrimitiveArray {
-                    array_hashes.objects.push(table.len() as u32);
-                    array_hashes.values.push(hashes[record[2] as usize]);
-                }
-                table.push(record[0], class, kind, record[1] as u32);
-                if keep {
-                    starts.push(record[2] as u32);
-                }
-            }
-        });
-        for (class, count) in self.classes.iter_mut().zip(instances) {
+        let merged = merge_table(&runs, &hashes, self.classes.len(), keep);
+        let table = ObjectTable::from_steps(&self.classes, sizing, merged.ids, merged.shapes);
+        for (class, count) in self.classes.iter_mut().zip(merged.instances) {
             class.instances = count;
         }
-        (table, class_class, starts, array_hashes)
+        (table, class_class, merged.starts, merged.hashes)
     }
 }
 
-/// Feed the records of sorted runs to `emit` in id order, an earlier run first on equal ids. Emits a
-/// stretch of the run with the smallest head at once, up to the next head.
-fn merge_runs(runs: &mut [&[Raw]], mut emit: impl FnMut(Raw)) {
-    let head = |runs: &[&[Raw]], run: usize| runs[run].first().map(|record| Reverse((record[0], run)));
+/// The merge of sorted runs as stretches in output order, `(run, start, end)`: id order, an earlier run
+/// first on equal ids, which is a stable sort. A stretch runs from the smallest head up to the next one.
+fn merge_stretches(runs: &[&[Raw]]) -> Vec<(usize, usize, usize)> {
+    let mut at = vec![0usize; runs.len()];
+    let head = |run: usize, at: &[usize]| runs[run].get(at[run]).map(|record| Reverse((record[0], run)));
     let mut heads: BinaryHeap<Reverse<(u64, usize)>> =
-        (0..runs.len()).filter_map(|run| head(runs, run)).collect();
+        (0..runs.len()).filter_map(|run| head(run, &at)).collect();
+    let mut stretches = Vec::new();
     while let Some(Reverse((_, run))) = heads.pop() {
-        let stretch = match heads.peek() {
-            None => runs[run].len(),
-            Some(&Reverse(next)) => runs[run].partition_point(|record| (record[0], run) < next).max(1),
+        let rest = &runs[run][at[run]..];
+        let len = match heads.peek() {
+            None => rest.len(),
+            Some(&Reverse(next)) => rest.partition_point(|record| (record[0], run) < next).max(1),
         };
-        let (taken, rest) = runs[run].split_at(stretch);
-        for &record in taken {
-            emit(record);
-        }
-        runs[run] = rest;
-        heads.extend(head(runs, run));
+        stretches.push((run, at[run], at[run] + len));
+        at[run] += len;
+        heads.extend(head(run, &at));
     }
+    stretches
+}
+
+/// The object table's columns, merged from the walk's runs.
+struct Merged {
+    ids: TableIds,
+    shapes: Column<[u32; 2]>,
+    starts: Column<u32>,
+    hashes: Column<[u64; 2]>,
+    instances: Vec<u64>,
+}
+
+/// Merge the runs into the table's columns, one of each id kept (the first), over the workers: each
+/// stretch is counted first, so every worker knows where its stretches' objects go.
+fn merge_table(runs: &[&[Raw]], hashes: &[[u64; 2]], class_count: usize, keep: bool) -> Merged {
+    let stretches = merge_stretches(runs);
+    let records = |&(run, start, end): &(usize, usize, usize)| &runs[run][start..end];
+    let last_id = |k: usize| {
+        k.checked_sub(1).map(|k| records(&stretches[k]).last().expect("stretches are not empty")[0])
+    };
+    let base = stretches.first().map_or(0, |stretch| records(stretch)[0][0]);
+    let fits = |id: u64| (id - base).trailing_zeros() >= 3 && u32::try_from((id - base) >> 3).is_ok();
+    // Kept objects and primitive arrays per stretch, and whether its ids fit four bytes.
+    let counts: Vec<(usize, usize, bool)> = parallel::ranges(stretches.len(), |lo, hi| {
+        (lo..hi)
+            .map(|k| {
+                let (mut previous, mut kept, mut arrays, mut fit) = (last_id(k), 0, 0, true);
+                for record in records(&stretches[k]) {
+                    if previous != Some(record[0]) {
+                        kept += 1;
+                        arrays += usize::from(raw_kind(*record) == Kind::PrimitiveArray);
+                        fit &= fits(record[0]);
+                    }
+                    previous = Some(record[0]);
+                }
+                (kept, arrays, fit)
+            })
+            .collect::<Vec<_>>()
+    })
+    .concat();
+    let total: usize = counts.iter().map(|count| count.0).sum();
+    let total_arrays: usize = counts.iter().map(|count| count.1).sum();
+    let narrow = counts.iter().all(|count| count.2);
+    let mut ids = if narrow {
+        TableIds::Steps(base, Column::zeroed(total))
+    } else {
+        TableIds::Wide(Column::zeroed(total))
+    };
+    let mut shapes = Column::<[u32; 2]>::zeroed(total);
+    let mut starts = Column::<u32>::zeroed(if keep { total } else { 0 });
+    let mut array_values = Column::<[u64; 2]>::zeroed(total_arrays);
+    // Stretches in groups of about equal size, one per worker, each writing its own slice of every column.
+    let groups = parallel::threads().max(1) * 4;
+    let step = total.div_ceil(groups).max(1);
+    let mut bounds = vec![0usize];
+    let mut filled = 0;
+    for (k, count) in counts.iter().enumerate() {
+        filled += count.0;
+        if filled >= step * bounds.len() && k + 1 < stretches.len() {
+            bounds.push(k + 1);
+        }
+    }
+    bounds.push(stretches.len());
+    let mut tasks = Vec::new();
+    let (mut id_rest, mut wide_rest): (&mut [u32], &mut [u64]) = match &mut ids {
+        TableIds::Steps(_, steps) => (&mut steps[..], &mut []),
+        TableIds::Wide(wide) => (&mut [], &mut wide[..]),
+    };
+    let (mut shape_rest, mut start_rest) = (&mut shapes[..], &mut starts[..]);
+    let mut value_rest = &mut array_values[..];
+    for pair in bounds.windows(2) {
+        let (lo, hi) = (pair[0], pair[1]);
+        let objects: usize = counts[lo..hi].iter().map(|count| count.0).sum();
+        let arrays: usize = counts[lo..hi].iter().map(|count| count.1).sum();
+        let (id_part, rest) = std::mem::take(&mut id_rest).split_at_mut(if narrow { objects } else { 0 });
+        id_rest = rest;
+        let (wide_part, rest) = std::mem::take(&mut wide_rest).split_at_mut(if narrow { 0 } else { objects });
+        wide_rest = rest;
+        let (shape_part, rest) = std::mem::take(&mut shape_rest).split_at_mut(objects);
+        shape_rest = rest;
+        let (start_part, rest) = std::mem::take(&mut start_rest).split_at_mut(if keep { objects } else { 0 });
+        start_rest = rest;
+        let (value_part, rest) = std::mem::take(&mut value_rest).split_at_mut(arrays);
+        value_rest = rest;
+        let (stretches, records) = (&stretches, &records);
+        tasks.push(move || {
+            let mut instances = vec![0u64; class_count];
+            let (mut at, mut array_at, mut previous) = (0, 0, last_id(lo));
+            for stretch in &stretches[lo..hi] {
+                for &record in records(stretch) {
+                    if previous == Some(record[0]) {
+                        continue;
+                    }
+                    previous = Some(record[0]);
+                    let (class, kind) = (raw_class(record), raw_kind(record));
+                    instances[class as usize] += 1;
+                    if kind == Kind::PrimitiveArray {
+                        value_part[array_at] = hashes[record[2] as usize];
+                        array_at += 1;
+                    }
+                    if narrow {
+                        id_part[at] = ((record[0] - base) >> 3) as u32;
+                    } else {
+                        wide_part[at] = record[0];
+                    }
+                    shape_part[at] = [class << KIND_BITS | kind as u32, record[1] as u32];
+                    if keep {
+                        start_part[at] = record[2] as u32;
+                    }
+                    at += 1;
+                }
+            }
+            instances
+        });
+    }
+    let parts = parallel::run_all(tasks);
+    let mut instances = vec![0u64; class_count];
+    for part in parts {
+        instances.iter_mut().zip(part).for_each(|(total, count)| *total += count);
+    }
+    Merged { ids, shapes, starts, hashes: array_values, instances }
 }
 
 /// Resolve the roots against the object table and list each thread once.
@@ -838,6 +961,33 @@ fn layout(
     class.footprint = footprint.min(u64::from(u32::MAX)) as u32;
     class.shallow = sizing.instance_size(footprint);
     class.slots = slots;
+}
+
+/// Footprints and shallow sizes under `sizing` for layouts already fixed, in the same order and with the
+/// same depth cap as [`layout`].
+fn size_classes(classes: &mut [Class], sizing: &Sizing) {
+    let mut sized = vec![false; classes.len()];
+    for i in 0..classes.len() {
+        size_class(classes, i as u32, &mut sized, sizing, 0);
+    }
+}
+
+fn size_class(classes: &mut [Class], idx: u32, sized: &mut [bool], sizing: &Sizing, depth: usize) {
+    let i = idx as usize;
+    if sized[i] {
+        return;
+    }
+    sized[i] = true;
+    let mut footprint: u64 =
+        classes[i].fields.iter().map(|field| u64::from(sizing.field_size(field.ty))).sum();
+    let super_idx = classes[i].superclass;
+    if super_idx != NONE && depth < MAX_CLASS_DEPTH {
+        size_class(classes, super_idx, sized, sizing, depth + 1);
+        footprint += u64::from(classes[super_idx as usize].footprint);
+    }
+    let class = &mut classes[i];
+    class.footprint = footprint.min(u64::from(u32::MAX)) as u32;
+    class.shallow = sizing.instance_size(footprint);
 }
 
 /// Tag every `Reference` subclass with its family.

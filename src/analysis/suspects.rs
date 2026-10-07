@@ -122,17 +122,21 @@ impl Heap<'_> {
             |object: u32| bits[object as usize / u64::BITS as usize] >> (object % u64::BITS) & 1 != 0;
         let mut referrers =
             self.referrers(|target| is_member(target).then(|| slot[self.class(target) as usize] as usize));
-        let mut covered: Vec<u32> = Vec::new();
+        let mut covered = vec![false; self.dump.classes.len()];
         for (i, (&row, class_members)) in rows.iter().zip(&members).enumerate() {
-            let owned = class_members
-                .iter()
-                .filter(|&&member| {
-                    let dominator = self.dominators.idom[member as usize];
-                    dominator != self.graph.root && covered.contains(&self.class(dominator))
-                })
-                .count() as u64;
-            let seen = owned + inside.get(&row.class).copied().unwrap_or(0);
-            covered.push(row.class);
+            let owned: usize = parallel::ranges(class_members.len(), |lo, hi| {
+                class_members[lo..hi]
+                    .iter()
+                    .filter(|&&member| {
+                        let dominator = self.dominators.idom[member as usize];
+                        dominator != self.graph.root && covered[self.class(dominator) as usize]
+                    })
+                    .count()
+            })
+            .into_iter()
+            .sum();
+            let seen = owned as u64 + inside.get(&row.class).copied().unwrap_or(0);
+            covered[row.class as usize] = true;
             if seen * 2 >= row.instances {
                 continue;
             }

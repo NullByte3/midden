@@ -7,7 +7,7 @@ use std::thread;
 
 use zerocopy::FromZeros;
 
-use super::store::Column;
+use super::store::{Bits, Column};
 
 /// Workers when the core count is unknown, and before `--threads` is applied.
 pub const DEFAULT_THREADS: usize = 4;
@@ -162,4 +162,20 @@ pub fn iota(len: usize) -> Column<u32> {
         }
     });
     column
+}
+
+/// A bit per index in `0..len`, set where `f` holds, filled by the workers.
+pub fn bits(len: usize, f: impl Fn(usize) -> bool + Sync) -> Bits {
+    let mut bits = Bits::new(len);
+    chunks(bits.words(), |start, words| {
+        for (word, at) in words.iter_mut().zip((start * 64..).step_by(64)) {
+            *word = (at..(at + 64).min(len)).rev().fold(0, |word, index| word << 1 | u64::from(f(index)));
+        }
+    });
+    bits
+}
+
+/// Run each task on its own worker; results in task order.
+pub fn run_all<T: Send>(tasks: Vec<impl FnOnce() -> T + Send>) -> Vec<T> {
+    run(tasks.into_iter())
 }
