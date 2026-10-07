@@ -5,6 +5,8 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::io;
 use std::sync::Arc;
+use std::sync::mpsc::sync_channel;
+use std::thread;
 
 use super::analysis::duplicates::boxed_classes;
 use super::detail::ArrayHash;
@@ -497,76 +499,100 @@ impl Indexer {
         let (id_size, class_by_id, classes, boxed, copying, base) =
             (self.id_size, &self.class_by_id, &self.classes, &self.boxed, !self.late, self.references.base);
         let (mut complete, mut class_dumps) = (true, Vec::new());
-        parallel::ordered(
-            &runs,
-            |&(start, end)| {
-                let mut reader = Reader::open_at(view, start, id_size).ok()?;
-                reader.progress = progress.counter(start);
-                let mut part = Part {
-                    id_size,
-                    class_by_id,
-                    classes,
-                    boxed,
-                    prim_array_classes,
-                    missed: false,
-                    copying,
-                    class_dumps: Vec::new(),
-                    objects: Vec::new(),
-                    starts: Vec::new(),
-                    max_id: 0,
-                    references: Copied::new(Vec::new(), base),
-                    hashes: Vec::new(),
-                    boxed_values: FastMap::default(),
-                    roots: Vec::new(),
-                    last_class: (0, NONE),
-                };
-                let mut part_walked = Walked::default();
-                hprof::heap(&mut reader, Some(end), &mut part, &mut part_walked).ok()?;
-                (!part.missed).then_some(Parsed {
-                    class_dumps: part.class_dumps,
-                    objects: part.objects,
-                    starts: part.starts,
-                    max_id: part.max_id,
-                    references: part.references,
-                    hashes: part.hashes,
-                    boxed_values: part.boxed_values,
-                    copied: part.copying,
-                    roots: part.roots,
-                    walked: part_walked,
-                })
-            },
-            |part| {
-                let Some(part) = part else {
-                    complete = false;
-                    return false;
-                };
-                class_dumps.extend(part.class_dumps);
-                self.late |= !part.copied;
-                // Starts are the part's own: move them past what earlier parts copied.
-                let (reference_base, hash_base) = (self.references.len() as u64, self.hashes.len() as u64);
-                if !self.late {
-                    let escapes = part.references.escapes.iter().map(|&(at, id)| (at + reference_base, id));
-                    self.references.escapes.extend(escapes);
-                    self.references.ids.extend_from_slice(&part.references.ids);
+        let (mut reference_len, mut hash_len) = (self.references.len() as u64, self.hashes.len() as u64);
+        let (ids, objects, starts) = (&mut self.references.ids, &mut self.objects, &mut self.starts);
+        // Copying the big tables is slow, so each one gets its own thread.
+        // Before, one thread copied them all and the parsing threads sat waiting.
+        // Each queue holds at most 4 parts, so memory stays bounded.
+        thread::scope(|scope| {
+            let (ids_to, ids_from) = sync_channel::<Vec<u32>>(4);
+            let (objects_to, objects_from) = sync_channel::<Arc<Vec<Raw>>>(4);
+            let (starts_to, starts_from) = sync_channel::<(Arc<Vec<Raw>>, Vec<u32>, u64, u64)>(4);
+            scope.spawn(move || ids_from.iter().for_each(|part| ids.extend_from_slice(&part)));
+            scope.spawn(move || objects_from.iter().for_each(|part| objects.extend_from_slice(&part)));
+            scope.spawn(move || {
+                for (records, part, reference_base, hash_base) in starts_from {
+                    starts.reserve(part.len());
+                    for (&record, &start) in records.iter().zip(&part) {
+                        let base =
+                            if raw_kind(record) == Kind::PrimitiveArray { hash_base } else { reference_base };
+                        starts.push(start.wrapping_add(base as u32));
+                    }
                 }
-                self.hashes.extend_from_slice(&part.hashes);
-                for (key, count) in part.boxed_values {
-                    *self.boxed_values.entry(key).or_default() += count;
-                }
-                self.max_id = self.max_id.max(part.max_id);
-                self.objects.extend_from_slice(&part.objects);
-                self.starts.reserve(part.starts.len());
-                for (&record, &start) in part.objects.iter().zip(&part.starts) {
-                    let base =
-                        if raw_kind(record) == Kind::PrimitiveArray { hash_base } else { reference_base };
-                    self.starts.push(start.wrapping_add(base as u32));
-                }
-                self.roots.extend(part.roots);
-                walked.chunks.extend(part.walked.chunks);
-                walked.pieces.extend(part.walked.pieces);
-                true
-            },
-        );
+            });
+            parallel::ordered(
+                &runs,
+                |&(start, end)| {
+                    let mut reader = Reader::open_at(view, start, id_size).ok()?;
+                    reader.progress = progress.counter(start);
+                    let mut part = Part {
+                        id_size,
+                        class_by_id,
+                        classes,
+                        boxed,
+                        prim_array_classes,
+                        missed: false,
+                        copying,
+                        class_dumps: Vec::new(),
+                        objects: Vec::new(),
+                        starts: Vec::new(),
+                        max_id: 0,
+                        references: Copied::new(Vec::new(), base),
+                        hashes: Vec::new(),
+                        boxed_values: FastMap::default(),
+                        roots: Vec::new(),
+                        last_class: (0, NONE),
+                    };
+                    let mut part_walked = Walked::default();
+                    hprof::heap(&mut reader, Some(end), &mut part, &mut part_walked).ok()?;
+                    (!part.missed).then_some(Parsed {
+                        class_dumps: part.class_dumps,
+                        objects: part.objects,
+                        starts: part.starts,
+                        max_id: part.max_id,
+                        references: part.references,
+                        hashes: part.hashes,
+                        boxed_values: part.boxed_values,
+                        copied: part.copying,
+                        roots: part.roots,
+                        walked: part_walked,
+                    })
+                },
+                |part| {
+                    let Some(part) = part else {
+                        complete = false;
+                        return false;
+                    };
+                    class_dumps.extend(part.class_dumps);
+                    self.late |= !part.copied;
+                    // Starts are the part's own: move them past what earlier parts copied.
+                    let (reference_base, hash_base) = (reference_len, hash_len);
+                    if !self.late {
+                        let escapes =
+                            part.references.escapes.iter().map(|&(at, id)| (at + reference_base, id));
+                        self.references.escapes.extend(escapes);
+                        reference_len += part.references.ids.len() as u64;
+                        ids_to.send(part.references.ids).expect("appender stopped");
+                    }
+                    hash_len += part.hashes.len() as u64;
+                    self.hashes.extend_from_slice(&part.hashes);
+                    for (key, count) in part.boxed_values {
+                        *self.boxed_values.entry(key).or_default() += count;
+                    }
+                    self.max_id = self.max_id.max(part.max_id);
+                    let records = Arc::new(part.objects);
+                    objects_to.send(Arc::clone(&records)).expect("appender stopped");
+                    starts_to
+                        .send((records, part.starts, reference_base, hash_base))
+                        .expect("appender stopped");
+                    self.roots.extend(part.roots);
+                    walked.chunks.extend(part.walked.chunks);
+                    walked.pieces.extend(part.walked.pieces);
+                    true
+                },
+            );
+            drop((ids_to, objects_to, starts_to));
+        });
         // Class dumps can mint placeholders, which the workers must not see change.
         for class_dump in class_dumps {
             self.class(class_dump);
