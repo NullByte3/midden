@@ -62,10 +62,13 @@ pub fn items<I: Sync, T: Send>(items: &[I], f: impl Fn(&I) -> T + Sync) -> Vec<T
     out.into_iter().map(|(_, result)| result).collect()
 }
 
-/// Run each task on its own scoped thread; results in task order.
-fn run<'env, T: Send + 'env>(tasks: impl Iterator<Item = impl FnOnce() -> T + Send + 'env>) -> Vec<T> {
+/// Run each task on a scoped worker, or on the caller for a single task; results in task order.
+fn run<'env, T: Send + 'env>(mut tasks: impl Iterator<Item = impl FnOnce() -> T + Send + 'env>) -> Vec<T> {
+    let Some(first) = tasks.next() else { return Vec::new() };
+    let Some(second) = tasks.next() else { return vec![first()] };
     thread::scope(|scope| {
-        let handles: Vec<_> = tasks.map(|task| scope.spawn(task)).collect();
+        let handles: Vec<_> =
+            [first, second].into_iter().chain(tasks).map(|task| scope.spawn(task)).collect();
         handles.into_iter().map(|handle| handle.join().expect("worker panicked")).collect()
     })
 }
