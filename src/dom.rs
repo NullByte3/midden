@@ -37,17 +37,12 @@ fn reach_blocking(graph: &Graph, dump: &Dump, blocked: &[(u32, u32)]) -> Reachab
     // Parents plus one, so zeroed pages read back `NONE` for the unreached.
     let mut parent_column = Column::<u32>::zeroed(object_count);
     let mut seen_bits = Bits::new(object_count);
-    let (parent, seen) = (parent_column.atomics(), seen_bits.atomics());
-    let visit = |object: u32| {
-        let bit = 1u64 << (object % 64);
-        seen[object as usize / 64].fetch_or(bit, Relaxed) & bit == 0
-    };
-    let is_seen = |object: u32| seen[object as usize / 64].load(Relaxed) >> (object % 64) & 1 != 0;
     let allowed = |from: u32, to: u32| blocked.is_empty() || !blocked.contains(&(from, to));
     let mut order = Column::<u32>::with_capacity(object_count);
     for &root in &graph.roots {
-        if visit(root) {
-            parent[root as usize].store(graph.root + 1, Relaxed);
+        if !seen_bits.get(root as usize) {
+            seen_bits.set(root as usize);
+            parent_column[root as usize] = graph.root + 1;
             order.push(root);
         }
     }
@@ -60,13 +55,20 @@ fn reach_blocking(graph: &Graph, dump: &Dump, blocked: &[(u32, u32)]) -> Reachab
             for pos in lo..hi {
                 let from = order[pos];
                 for target in graph.edges(from).targets() {
-                    if !is_seen(target) && allowed(from, target) && visit(target) {
-                        parent[target as usize].store(from + 1, Relaxed);
+                    if !seen_bits.get(target as usize) && allowed(from, target) {
+                        seen_bits.set(target as usize);
+                        parent_column[target as usize] = from + 1;
                         order.push(target);
                     }
                 }
             }
         } else {
+            let (parent, seen) = (parent_column.atomics(), seen_bits.atomics());
+            let is_seen = |object: u32| seen[object as usize / 64].load(Relaxed) >> (object % 64) & 1 != 0;
+            let visit = |object: u32| {
+                let bit = 1u64 << (object % 64);
+                seen[object as usize / 64].fetch_or(bit, Relaxed) & bit == 0
+            };
             let claim = claim_column.get_or_insert_with(|| Column::zeroed(object_count)).atomics();
             let frontier = &order[lo..hi];
             let found = parallel::ranges(frontier.len(), |start, end| {
