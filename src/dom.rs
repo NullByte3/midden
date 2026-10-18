@@ -428,7 +428,13 @@ pub fn dominators(graph: &Graph, dump: &Dump) -> DominatorTree {
             stack.pop();
             continue;
         }
-        frame.1 += 1;
+        // Once this edge is taken, an exhausted frame has no work to resume. Drop it before
+        // descending so a linked list needs constant stack space rather than one frame per object.
+        if next + 1 == end {
+            stack.pop();
+        } else {
+            frame.1 += 1;
+        }
         let successor = if number == 0 { graph.roots[next] } else { targets[next] };
         if unvisited.take(successor as usize) {
             let successor_number = vertex.len() as u32;
