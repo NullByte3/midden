@@ -595,11 +595,24 @@ pub fn dominators(graph: &Graph, dump: &Dump) -> DominatorTree {
     {
         let (bytes, counts) = (subtree_bytes.atomics(), size.atomics());
         parallel::ranges(object_count, |lo, hi| {
+            // Adjacent leaves often belong to the same array. Combine their contributions before
+            // touching its shared counters, which otherwise serialize all workers on that array.
+            let (mut owner, mut total, mut count) = (0, 0u64, 0u32);
             for (object, (&leaf, &number)) in (lo..hi).zip(idom[lo..hi].iter().zip(&dfs_number[lo..hi])) {
                 if number == LEAF && leaf != 0 {
-                    bytes[leaf as usize - 1].fetch_add(u64::from(dump.objects.shallow(object)), Relaxed);
-                    counts[leaf as usize - 1].fetch_add(1, Relaxed);
+                    if leaf != owner && count != 0 {
+                        bytes[owner as usize - 1].fetch_add(total, Relaxed);
+                        counts[owner as usize - 1].fetch_add(count, Relaxed);
+                        (total, count) = (0, 0);
+                    }
+                    owner = leaf;
+                    total += u64::from(dump.objects.shallow(object));
+                    count += 1;
                 }
+            }
+            if count != 0 {
+                bytes[owner as usize - 1].fetch_add(total, Relaxed);
+                counts[owner as usize - 1].fetch_add(count, Relaxed);
             }
         });
     }
