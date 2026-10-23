@@ -684,17 +684,33 @@ pub fn dominators(graph: &Graph, dump: &Dump) -> DominatorTree {
         let (preorder, subtree_end) = (preorder.atomics(), subtree_end.atomics());
         let (free, numbers) = (free.atomics(), dfs_number.atomics());
         parallel::ranges(object_count, |lo, hi| {
-            for object in lo..hi {
+            let mut object = lo;
+            while object < hi {
                 if numbers[object].load(Relaxed) != LEAF {
+                    object += 1;
                     continue;
                 }
-                match idom[object] {
-                    NONE => numbers[object].store(NONE, Relaxed),
+                let dominator = idom[object];
+                let start = object;
+                object += 1;
+                while object < hi && idom[object] == dominator && numbers[object].load(Relaxed) == LEAF {
+                    object += 1;
+                }
+                match dominator {
+                    NONE => {
+                        for number in &numbers[start..object] {
+                            number.store(NONE, Relaxed);
+                        }
+                    }
                     dominator => {
-                        let at =
-                            free[numbers[dominator as usize].load(Relaxed) as usize].fetch_add(1, Relaxed);
-                        preorder[at as usize].store(object as u32, Relaxed);
-                        subtree_end[at as usize].store(at + 1, Relaxed);
+                        // Reserve a whole run with one atomic operation; every worker then writes
+                        // its leaves to a disjoint, contiguous slice of the preorder.
+                        let first = free[numbers[dominator as usize].load(Relaxed) as usize]
+                            .fetch_add((object - start) as u32, Relaxed);
+                        for (object, at) in (start..object).zip(first..) {
+                            preorder[at as usize].store(object as u32, Relaxed);
+                            subtree_end[at as usize].store(at + 1, Relaxed);
+                        }
                     }
                 }
             }
