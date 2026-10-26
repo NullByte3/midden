@@ -300,7 +300,13 @@ impl DominatorTree {
 
     /// Children, biggest retained first. Sorted on demand: the report opens a few hundred of millions.
     pub fn children(&self, object: u32) -> Vec<u32> {
-        let mut children: Vec<u32> = self.preorder_children(object).collect();
+        self.children_matching(object, |_| true)
+    }
+
+    /// Visit every child, sorting only those accepted by `take`. Reports can count hidden children
+    /// without allocating and sorting a list of millions of objects they will never display.
+    pub fn children_matching(&self, object: u32, mut take: impl FnMut(u32) -> bool) -> Vec<u32> {
+        let mut children: Vec<u32> = self.preorder_children(object).filter(|&child| take(child)).collect();
         children.sort_unstable_by(|&a, &b| self.bigger(a, b));
         children
     }

@@ -337,12 +337,16 @@ impl<'a> Plan<'a> {
         self.shown.push(object);
         rows.push(TreeRow { depth, object, label, hidden: None });
         let mut hidden = (0u64, 0u64);
-        for child in heap.dominators.children(object) {
+        let children = heap.dominators.children_matching(object, |child| {
             if depth + 1 >= self.view.depth || heap.retained(child) < floor.max(1) {
                 hidden.0 += 1;
                 hidden.1 += heap.retained(child);
-                continue;
+                false
+            } else {
+                true
             }
+        });
+        for child in children {
             let label = heap.graph.label_of(object, child);
             self.tree(child, label, depth + 1, floor, rows);
         }
