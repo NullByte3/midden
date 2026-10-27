@@ -8,6 +8,9 @@ use super::graph::Graph;
 use super::parallel;
 use super::store::{Bits, Column};
 
+#[cfg(test)]
+mod tests;
+
 /// Parent and dominator chains are cut at this length, so a corrupt tree cannot loop.
 const MAX_CHAIN_LEN: usize = 50_000_000;
 
