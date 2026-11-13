@@ -4,9 +4,7 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::io;
-use std::sync::Arc;
-use std::sync::mpsc::sync_channel;
-use std::thread;
+use std::sync::{Arc, Mutex};
 
 use super::analysis::duplicates::boxed_classes;
 use super::detail::ArrayHash;
@@ -25,20 +23,18 @@ use super::source::Progress;
 use super::store::Column;
 use crate::error::{Error, Result};
 
-/// An object as the walk meets it: id, then class and kind above the length, then where its references
-/// start in the copied ids, or for a primitive array where its hashes are (`raw`).
-type Raw = [u64; 2];
-
-fn raw(id: u64, class: u32, kind: Kind, len: u32) -> Raw {
-    [id, u64::from(class) << 34 | (kind as u64) << 32 | u64::from(len)]
+/// An object as the walk meets it, beside its id: class and kind above the length. Its start is where
+/// its references are in the copied ids, or for a primitive array where its hashes are.
+fn word(class: u32, kind: Kind, len: u32) -> u64 {
+    u64::from(class) << 34 | (kind as u64) << 32 | u64::from(len)
 }
 
-fn raw_class(record: Raw) -> u32 {
-    (record[1] >> 34) as u32
+fn word_class(word: u64) -> u32 {
+    (word >> 34) as u32
 }
 
-fn raw_kind(record: Raw) -> Kind {
-    Kind::ALL[(record[1] >> 32 & 3) as usize]
+fn word_kind(word: u64) -> Kind {
+    Kind::ALL[(word >> 32 & 3) as usize]
 }
 
 /// Byte and char arrays up to this long get the String hash as the walk reads them; a String's longer
@@ -145,10 +141,13 @@ pub struct Indexer {
     names: Vec<String>,
     name_by_text: HashMap<String, u32>,
     name_by_id: FastMap<u64, u32>,
-    objects: Column<Raw>,
+    /// The sequential walk's records: each one's id and word.
+    objects: Column<[u64; 2]>,
     /// Per record, where its copied references start, or a primitive array's hash slot. Four bytes: the
     /// references are only kept while they fit.
     starts: Column<u32>,
+    /// The workers' parts in file order, kept as read.
+    parts: Vec<Kept>,
     /// The highest object id met, which picks the size convention.
     max_id: u64,
     references: Copied<Column<u32>>,
@@ -181,6 +180,7 @@ impl Indexer {
             name_by_id: FastMap::default(),
             objects: Column::with_capacity(0),
             starts: Column::with_capacity(0),
+            parts: Vec::new(),
             max_id: 0,
             references: Copied::new(Column::with_capacity(0), 0),
             hashes: Column::with_capacity(0),
@@ -244,6 +244,11 @@ impl Indexer {
         for (class, _, offset, ty) in boxed_classes(&self.classes, &self.names, self.id_size) {
             self.boxed[class as usize] = Some((offset, ty));
         }
+    }
+
+    /// Keep an object's id and word, paired: one array to fill as the walk goes.
+    fn keep(&mut self, id: u64, word: u64) {
+        self.objects.push([id, word]);
     }
 
     /// Whether the walk copies references: the layouts are fixed and no class dump came after them.
@@ -317,7 +322,7 @@ macro_rules! object_callbacks {
                 copy_instance(copied, self.id_size, body, &mut self.references, &mut self.boxed_values)?;
             }
             self.max_id = self.max_id.max(id);
-            self.objects.push(raw(id, class, Kind::Instance, len));
+            self.keep(id, word(class, Kind::Instance, len));
             self.starts.push(start as u32);
             Ok(())
         }
@@ -329,7 +334,7 @@ macro_rules! object_callbacks {
                 copy_elements(self.id_size as usize, body, &mut self.references)?;
             }
             self.max_id = self.max_id.max(id);
-            self.objects.push(raw(id, class, Kind::ObjectArray, len));
+            self.keep(id, word(class, Kind::ObjectArray, len));
             self.starts.push(start as u32);
             Ok(())
         }
@@ -339,7 +344,7 @@ macro_rules! object_callbacks {
             let at = self.hashes.len();
             self.hashes.push(hash_array(ty, len, body)?);
             self.max_id = self.max_id.max(id);
-            self.objects.push(raw(id, class, Kind::PrimitiveArray, len));
+            self.keep(id, word(class, Kind::PrimitiveArray, len));
             self.starts.push(at as u32);
             Ok(())
         }
@@ -401,7 +406,8 @@ struct Part<'a> {
     /// Copy references: false once a class dump turned up after the layouts were fixed.
     copying: bool,
     class_dumps: Vec<ClassDump>,
-    objects: Vec<Raw>,
+    ids: Vec<u64>,
+    words: Vec<u64>,
     starts: Vec<u32>,
     max_id: u64,
     references: Copied<Vec<u32>>,
@@ -432,6 +438,12 @@ impl Part<'_> {
     fn copies(&self) -> bool {
         self.copying
     }
+
+    /// Keep an object's id and word, apart: the merge reads them where they are.
+    fn keep(&mut self, id: u64, word: u64) {
+        self.ids.push(id);
+        self.words.push(word);
+    }
 }
 
 impl Sink for Part<'_> {
@@ -447,10 +459,22 @@ impl Sink for Part<'_> {
     object_callbacks!();
 }
 
+/// A part's records (ids, words and starts), copied ids and hashes. The starts are the part's own: a hash
+/// slot is a place in `hashes`, and `reference_base` moves a reference start past what earlier parts copied.
+struct Kept {
+    ids: Vec<u64>,
+    words: Vec<u64>,
+    starts: Vec<u32>,
+    references: Vec<u32>,
+    hashes: Vec<[u64; 2]>,
+    reference_base: u32,
+}
+
 /// What a worker's part brought back.
 struct Parsed {
     class_dumps: Vec<ClassDump>,
-    objects: Vec<Raw>,
+    ids: Vec<u64>,
+    words: Vec<u64>,
     starts: Vec<u32>,
     max_id: u64,
     references: Copied<Vec<u32>>,
@@ -499,103 +523,102 @@ impl Indexer {
         let (id_size, class_by_id, classes, boxed, copying, base) =
             (self.id_size, &self.class_by_id, &self.classes, &self.boxed, !self.late, self.references.base);
         let (mut complete, mut class_dumps) = (true, Vec::new());
-        let (mut reference_len, mut hash_len) = (self.references.len() as u64, self.hashes.len() as u64);
-        let (ids, objects, starts) = (&mut self.references.ids, &mut self.objects, &mut self.starts);
-        // Copying the big tables is slow, so each one gets its own thread.
-        // Before, one thread copied them all and the parsing threads sat waiting.
-        // Each queue holds at most 4 parts, so memory stays bounded.
-        thread::scope(|scope| {
-            let (ids_to, ids_from) = sync_channel::<Vec<u32>>(4);
-            let (objects_to, objects_from) = sync_channel::<Arc<Vec<Raw>>>(4);
-            let (starts_to, starts_from) = sync_channel::<(Arc<Vec<Raw>>, Vec<u32>, u64, u64)>(4);
-            scope.spawn(move || ids_from.iter().for_each(|part| ids.extend_from_slice(&part)));
-            scope.spawn(move || objects_from.iter().for_each(|part| objects.extend_from_slice(&part)));
-            scope.spawn(move || {
-                for (records, part, reference_base, hash_base) in starts_from {
-                    starts.reserve(part.len());
-                    for (&record, &start) in records.iter().zip(&part) {
-                        let base =
-                            if raw_kind(record) == Kind::PrimitiveArray { hash_base } else { reference_base };
-                        starts.push(start.wrapping_add(base as u32));
-                    }
+        // Each part's references go after those copied before it: the walk's own first, if any.
+        let mut copied = self.references.len() as u64;
+        parallel::ordered(
+            &runs,
+            |&(start, end)| {
+                let mut reader = Reader::open_at(view, start, id_size).ok()?;
+                reader.progress = progress.counter(start);
+                let mut part = Part {
+                    id_size,
+                    class_by_id,
+                    classes,
+                    boxed,
+                    prim_array_classes,
+                    missed: false,
+                    copying,
+                    class_dumps: Vec::new(),
+                    ids: Vec::new(),
+                    words: Vec::new(),
+                    starts: Vec::new(),
+                    max_id: 0,
+                    references: Copied::new(Vec::new(), base),
+                    hashes: Vec::new(),
+                    boxed_values: FastMap::default(),
+                    roots: Vec::new(),
+                    last_class: (0, NONE),
+                };
+                let mut part_walked = Walked::default();
+                hprof::heap(&mut reader, Some(end), &mut part, &mut part_walked).ok()?;
+                (!part.missed).then_some(Parsed {
+                    class_dumps: part.class_dumps,
+                    ids: part.ids,
+                    words: part.words,
+                    starts: part.starts,
+                    max_id: part.max_id,
+                    references: part.references,
+                    hashes: part.hashes,
+                    boxed_values: part.boxed_values,
+                    copied: part.copying,
+                    roots: part.roots,
+                    walked: part_walked,
+                })
+            },
+            |part| {
+                let Some(part) = part else {
+                    complete = false;
+                    return false;
+                };
+                class_dumps.extend(part.class_dumps);
+                self.late |= !part.copied;
+                let reference_base = copied;
+                if !self.late {
+                    let escapes = part.references.escapes.iter().map(|&(at, id)| (at + reference_base, id));
+                    self.references.escapes.extend(escapes);
+                    copied += part.references.ids.len() as u64;
                 }
-            });
-            parallel::ordered(
-                &runs,
-                |&(start, end)| {
-                    let mut reader = Reader::open_at(view, start, id_size).ok()?;
-                    reader.progress = progress.counter(start);
-                    let mut part = Part {
-                        id_size,
-                        class_by_id,
-                        classes,
-                        boxed,
-                        prim_array_classes,
-                        missed: false,
-                        copying,
-                        class_dumps: Vec::new(),
-                        objects: Vec::new(),
-                        starts: Vec::new(),
-                        max_id: 0,
-                        references: Copied::new(Vec::new(), base),
-                        hashes: Vec::new(),
-                        boxed_values: FastMap::default(),
-                        roots: Vec::new(),
-                        last_class: (0, NONE),
-                    };
-                    let mut part_walked = Walked::default();
-                    hprof::heap(&mut reader, Some(end), &mut part, &mut part_walked).ok()?;
-                    (!part.missed).then_some(Parsed {
-                        class_dumps: part.class_dumps,
-                        objects: part.objects,
-                        starts: part.starts,
-                        max_id: part.max_id,
-                        references: part.references,
-                        hashes: part.hashes,
-                        boxed_values: part.boxed_values,
-                        copied: part.copying,
-                        roots: part.roots,
-                        walked: part_walked,
-                    })
-                },
-                |part| {
-                    let Some(part) = part else {
-                        complete = false;
-                        return false;
-                    };
-                    class_dumps.extend(part.class_dumps);
-                    self.late |= !part.copied;
-                    // Starts are the part's own: move them past what earlier parts copied.
-                    let (reference_base, hash_base) = (reference_len, hash_len);
-                    if !self.late {
-                        let escapes =
-                            part.references.escapes.iter().map(|&(at, id)| (at + reference_base, id));
-                        self.references.escapes.extend(escapes);
-                        reference_len += part.references.ids.len() as u64;
-                        ids_to.send(part.references.ids).expect("appender stopped");
-                    }
-                    hash_len += part.hashes.len() as u64;
-                    self.hashes.extend_from_slice(&part.hashes);
-                    for (key, count) in part.boxed_values {
-                        *self.boxed_values.entry(key).or_default() += count;
-                    }
-                    self.max_id = self.max_id.max(part.max_id);
-                    let records = Arc::new(part.objects);
-                    objects_to.send(Arc::clone(&records)).expect("appender stopped");
-                    starts_to
-                        .send((records, part.starts, reference_base, hash_base))
-                        .expect("appender stopped");
-                    self.roots.extend(part.roots);
-                    walked.chunks.extend(part.walked.chunks);
-                    walked.pieces.extend(part.walked.pieces);
-                    true
-                },
-            );
-            drop((ids_to, objects_to, starts_to));
-        });
+                for (key, count) in part.boxed_values {
+                    *self.boxed_values.entry(key).or_default() += count;
+                }
+                self.max_id = self.max_id.max(part.max_id);
+                // The records stay where the worker put them; the merge reads them in place.
+                self.parts.push(Kept {
+                    ids: part.ids,
+                    words: part.words,
+                    starts: part.starts,
+                    references: part.references.ids,
+                    hashes: part.hashes,
+                    reference_base: reference_base as u32,
+                });
+                self.roots.extend(part.roots);
+                walked.chunks.extend(part.walked.chunks);
+                walked.pieces.extend(part.walked.pieces);
+                true
+            },
+        );
         // Class dumps can mint placeholders, which the workers must not see change.
         for class_dump in class_dumps {
             self.class(class_dump);
+        }
+        // The copied ids in one column, each part's after the one before, moved by the workers.
+        if complete && !self.late {
+            let mut ids = Column::<u32>::zeroed(copied as usize);
+            let (own, mut rest) = ids.split_at_mut(self.references.len());
+            own.copy_from_slice(&self.references.ids);
+            let mut moves = Vec::with_capacity(self.parts.len());
+            for part in &mut self.parts {
+                let (to, tail) = std::mem::take(&mut rest).split_at_mut(part.references.len());
+                rest = tail;
+                moves.push(Mutex::new((to, std::mem::take(&mut part.references))));
+            }
+            parallel::items(&moves, |pair| {
+                let mut pair = pair.lock().expect("worker panicked");
+                let from = std::mem::take(&mut pair.1);
+                pair.0.copy_from_slice(&from);
+            });
+            drop(moves);
+            self.references.ids = ids;
         }
         complete
     }
@@ -743,30 +766,38 @@ impl Indexer {
         // sticky-class roots point at them.
         let class_class = class_named(&self.classes, "java.lang.Class")
             .unwrap_or_else(|| push(&mut self.classes, Class::placeholder("java.lang.Class".to_string(), 0)));
-        let mut class_objects: Vec<Raw> = Vec::new();
+        let mut class_objects: Vec<(u64, u64)> = Vec::new();
         for class in self.classes.iter().filter(|class| class.dumped) {
             let statics_size: u64 =
                 class.statics.iter().map(|field| u64::from(sizing.field_size(field.ty))).sum();
-            class_objects.push(raw(class.id, class_class, Kind::Class, sizing.instance_size(statics_size)));
+            class_objects
+                .push((class.id, word(class_class, Kind::Class, sizing.instance_size(statics_size))));
         }
-        class_objects.sort_by_key(|record| record[0]);
-        let class_starts = vec![0u32; class_objects.len()];
-        let records = std::mem::replace(&mut self.objects, Column::with_capacity(0));
+        class_objects.sort_by_key(|&(id, _)| id);
+        let (class_ids, class_words): (Vec<u64>, Vec<u64>) = class_objects.into_iter().unzip();
+        let class_starts = vec![0u32; class_ids.len()];
+        let objects = std::mem::replace(&mut self.objects, Column::with_capacity(0));
         let starts = std::mem::replace(&mut self.starts, Column::with_capacity(0));
+        let parts = std::mem::take(&mut self.parts);
+        let hashes = std::mem::replace(&mut self.hashes, Column::with_capacity(0));
+        let walked = (Records::Paired(&objects), &starts[..], &hashes[..], 0);
+        let class_run = (Records::Apart(&class_ids, &class_words), &class_starts[..], &[][..], 0);
         // HotSpot writes by address in runs: merge the runs, earlier ones first on equal ids, which is
         // a stable sort. The first record of each id is kept.
         let mut runs: Vec<Run> = Vec::new();
-        let mut start = 0;
-        for i in 1..=records.len() {
-            if i == records.len() || records[i][0] < records[i - 1][0] {
-                runs.push((&records[start..i], &starts[start..i]));
-                start = i;
+        for (records, starts, hashes, reference_base) in runs_read(walked, &parts, class_run) {
+            let mut start = 0;
+            for i in 1..=records.len() {
+                if i == records.len() || records.id(i) < records.id(i - 1) {
+                    runs.push((records.range(start, i), &starts[start..i], hashes, reference_base));
+                    start = i;
+                }
             }
         }
-        runs.push((&class_objects, &class_starts));
-        runs.retain(|run| !run.0.is_empty());
-        let hashes = std::mem::replace(&mut self.hashes, Column::with_capacity(0));
-        let merged = merge_table(&runs, &hashes, self.classes.len(), keep);
+        let merged = merge_runs(&runs, self.classes.len(), keep);
+        drop(runs);
+        // Freeing what the walk read takes a while, and nothing waits for it.
+        std::thread::spawn(move || drop((parts, objects, starts, hashes)));
         let table = ObjectTable::from_steps(&self.classes, sizing, merged.ids, merged.shapes);
         for (class, count) in self.classes.iter_mut().zip(merged.instances) {
             class.instances = count;
@@ -775,22 +806,85 @@ impl Indexer {
     }
 }
 
-/// A run of records in id order, and where each one's references start (or its hash slot).
-type Run<'a> = (&'a [Raw], &'a [u32]);
+/// Records as the walk kept them: each one's id and word, paired by the sequential walk, apart in a
+/// worker's part.
+#[derive(Clone, Copy)]
+enum Records<'a> {
+    Paired(&'a [[u64; 2]]),
+    Apart(&'a [u64], &'a [u64]),
+}
+
+impl<'a> Records<'a> {
+    fn len(self) -> usize {
+        match self {
+            Records::Paired(records) => records.len(),
+            Records::Apart(_, words) => words.len(),
+        }
+    }
+
+    #[inline]
+    fn id(self, at: usize) -> u64 {
+        match self {
+            Records::Paired(records) => records[at][0],
+            Records::Apart(ids, _) => ids[at],
+        }
+    }
+
+    #[inline]
+    fn word(self, at: usize) -> u64 {
+        match self {
+            Records::Paired(records) => records[at][1],
+            Records::Apart(_, words) => words[at],
+        }
+    }
+
+    fn range(self, start: usize, end: usize) -> Records<'a> {
+        match self {
+            Records::Paired(records) => Records::Paired(&records[start..end]),
+            Records::Apart(ids, words) => Records::Apart(&ids[start..end], &words[start..end]),
+        }
+    }
+}
+
+/// A run of records, in id order once the runs are split: the records, where each one's references start
+/// (or its hash slot), the hashes the slots are in, and what to add to a reference start.
+type Run<'a> = (Records<'a>, &'a [u32], &'a [[u64; 2]], u32);
+
+/// Every run of records as read, in file order: the sequential walk's, each part's, the class objects'.
+fn runs_read<'a>(walked: Run<'a>, parts: &'a [Kept], classes: Run<'a>) -> Vec<Run<'a>> {
+    let parts = parts.iter().map(|part| {
+        (Records::Apart(&part.ids, &part.words), &part.starts[..], &part.hashes[..], part.reference_base)
+    });
+    std::iter::once(walked).chain(parts).chain([classes]).filter(|run| run.0.len() > 0).collect()
+}
 
 /// The merge of sorted runs as stretches in output order, `(run, start, end)`: id order, an earlier run
 /// first on equal ids, which is a stable sort. A stretch runs from the smallest head up to the next one.
 fn merge_stretches(runs: &[Run]) -> Vec<(usize, usize, usize)> {
     let mut at = vec![0usize; runs.len()];
-    let head = |run: usize, at: &[usize]| runs[run].0.get(at[run]).map(|record| Reverse((record[0], run)));
+    let head = |run: usize, at: &[usize]| {
+        (at[run] < runs[run].0.len()).then(|| Reverse((runs[run].0.id(at[run]), run)))
+    };
     let mut heads: BinaryHeap<Reverse<(u64, usize)>> =
         (0..runs.len()).filter_map(|run| head(run, &at)).collect();
     let mut stretches = Vec::new();
     while let Some(Reverse((_, run))) = heads.pop() {
-        let rest = &runs[run].0[at[run]..];
+        let (records, rest) = (runs[run].0, runs[run].0.len() - at[run]);
         let len = match heads.peek() {
-            None => rest.len(),
-            Some(&Reverse(next)) => rest.partition_point(|record| (record[0], run) < next).max(1),
+            None => rest,
+            Some(&Reverse(next)) => {
+                // The records of this run before the next head, by halving.
+                let (mut lo, mut hi) = (at[run], records.len());
+                while lo < hi {
+                    let mid = lo + (hi - lo) / 2;
+                    if (records.id(mid), run) < next {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                (lo - at[run]).max(1)
+            }
         };
         stretches.push((run, at[run], at[run] + len));
         at[run] += len;
@@ -798,6 +892,25 @@ fn merge_stretches(runs: &[Run]) -> Vec<(usize, usize, usize)> {
     }
     stretches
 }
+
+/// The table's columns from runs in id order, merged.
+fn merge_runs(runs: &[Run], class_count: usize, keep: bool) -> Merged {
+    let stretches = merge_stretches(runs);
+    let entries = |unit: usize| {
+        let (run, start, end) = stretches[unit];
+        let (records, starts, hashes, reference_base) = runs[run];
+        (start..end).map(move |at| (records.id(at), records.word(at), starts[at], hashes, reference_base))
+    };
+    let last = |unit: usize| {
+        let (run, _, end) = stretches[unit];
+        runs[run].0.id(end - 1)
+    };
+    merge_table(stretches.len(), entries, last, class_count, keep)
+}
+
+/// A record in id order: its id and word, where its references start (or its hash slot), the hashes the
+/// slot is in, and what to add to a reference start.
+type Entry<'a> = (u64, u64, u32, &'a [[u64; 2]], u32);
 
 /// The object table's columns, merged from the walk's runs.
 struct Merged {
@@ -808,29 +921,31 @@ struct Merged {
     instances: Vec<u64>,
 }
 
-/// Merge the runs into the table's columns, one of each id kept (the first), over the workers: each
-/// stretch is counted first, so every worker knows where its stretches' objects go.
-fn merge_table(runs: &[Run], hashes: &[[u64; 2]], class_count: usize, keep: bool) -> Merged {
-    let stretches = merge_stretches(runs);
-    let records = |&(run, start, end): &(usize, usize, usize)| &runs[run].0[start..end];
-    let starts_of = |&(run, start, end): &(usize, usize, usize)| &runs[run].1[start..end];
-    let last_id = |k: usize| {
-        k.checked_sub(1).map(|k| records(&stretches[k]).last().expect("stretches are not empty")[0])
-    };
-    let base = stretches.first().map_or(0, |stretch| records(stretch)[0][0]);
+/// The table's columns from `units` stretches of records in id order, `entries(unit)` each and `last(unit)`
+/// its last id, one of each id kept (the first), over the workers: each stretch is counted first, so every
+/// worker knows where its stretches' objects go.
+fn merge_table<'a, I: Iterator<Item = Entry<'a>>>(
+    units: usize,
+    entries: impl Fn(usize) -> I + Sync,
+    last: impl Fn(usize) -> u64 + Sync,
+    class_count: usize,
+    keep: bool,
+) -> Merged {
+    let last_id = |k: usize| k.checked_sub(1).map(&last);
+    let base = if units == 0 { 0 } else { entries(0).next().map_or(0, |entry| entry.0) };
     let fits = |id: u64| (id - base).trailing_zeros() >= 3 && u32::try_from((id - base) >> 3).is_ok();
     // Kept objects and primitive arrays per stretch, and whether its ids fit four bytes.
-    let counts: Vec<(usize, usize, bool)> = parallel::ranges(stretches.len(), |lo, hi| {
+    let counts: Vec<(usize, usize, bool)> = parallel::ranges(units, |lo, hi| {
         (lo..hi)
             .map(|k| {
                 let (mut previous, mut kept, mut arrays, mut fit) = (last_id(k), 0, 0, true);
-                for record in records(&stretches[k]) {
-                    if previous != Some(record[0]) {
+                for (id, word, ..) in entries(k) {
+                    if previous != Some(id) {
                         kept += 1;
-                        arrays += usize::from(raw_kind(*record) == Kind::PrimitiveArray);
-                        fit &= fits(record[0]);
+                        arrays += usize::from(word_kind(word) == Kind::PrimitiveArray);
+                        fit &= fits(id);
                     }
-                    previous = Some(record[0]);
+                    previous = Some(id);
                 }
                 (kept, arrays, fit)
             })
@@ -853,11 +968,11 @@ fn merge_table(runs: &[Run], hashes: &[[u64; 2]], class_count: usize, keep: bool
     let mut filled = 0;
     for (k, count) in counts.iter().enumerate() {
         filled += count.0;
-        if filled >= step * bounds.len() && k + 1 < stretches.len() {
+        if filled >= step * bounds.len() && k + 1 < units {
             bounds.push(k + 1);
         }
     }
-    bounds.push(stretches.len());
+    bounds.push(units);
     let mut tasks = Vec::new();
     let (mut id_rest, mut wide_rest) = (&mut steps[..], &mut wide[..]);
     let (mut shape_rest, mut start_rest) = (&mut words[..], &mut starts[..]);
@@ -877,29 +992,30 @@ fn merge_table(runs: &[Run], hashes: &[[u64; 2]], class_count: usize, keep: bool
         start_rest = rest;
         let (value_part, rest) = std::mem::take(&mut value_rest).split_at_mut(arrays);
         value_rest = rest;
-        let (stretches, records) = (&stretches, &records);
+        let (entries, last_id) = (&entries, &last_id);
         tasks.push(move || {
             let (mut instances, mut long) = (vec![0u64; class_count], Vec::new());
             let (mut at, mut array_at, mut previous) = (0, 0, last_id(lo));
-            for stretch in &stretches[lo..hi] {
-                for (&record, &start) in records(stretch).iter().zip(starts_of(stretch)) {
-                    if previous == Some(record[0]) {
+            for unit in lo..hi {
+                for (id, record, start, hashes, reference_base) in entries(unit) {
+                    if previous == Some(id) {
                         continue;
                     }
-                    previous = Some(record[0]);
-                    let (class, kind) = (raw_class(record), raw_kind(record));
+                    previous = Some(id);
+                    let (class, kind) = (word_class(record), word_kind(record));
                     instances[class as usize] += 1;
                     if kind == Kind::PrimitiveArray {
                         value_part[array_at] = hashes[start as usize];
                         array_at += 1;
                     }
+                    let start = start.wrapping_add(reference_base);
                     if narrow {
-                        id_part[at] = ((record[0] - base) >> 3) as u32;
+                        id_part[at] = ((id - base) >> 3) as u32;
                     } else {
-                        wide_part[at] = record[0];
+                        wide_part[at] = id;
                     }
                     // An instance's size comes from its class.
-                    let len = if kind == Kind::Instance { 0 } else { record[1] as u32 };
+                    let len = if kind == Kind::Instance { 0 } else { record as u32 };
                     let (word, too_long) = packing.pack(class, kind, len);
                     shape_part[at] = word;
                     long.extend(too_long.map(|len| ((first_object + at) as u32, len)));
