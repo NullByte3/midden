@@ -4,6 +4,7 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 
 use super::analysis::duplicates::boxed_classes;
@@ -20,7 +21,7 @@ use super::hprof::{
 use super::parallel;
 use super::sizes::{SizeMode, Sizing};
 use super::source::Progress;
-use super::store::Column;
+use super::store::{Blocked, Column};
 use crate::error::{Error, Result};
 
 /// An object as the walk meets it, beside its id: class and kind above the length. Its start is where
@@ -439,7 +440,7 @@ impl Part<'_> {
         self.copying
     }
 
-    /// Keep an object's id and word, apart: the merge reads them where they are.
+    /// Keep an object's id and word, apart: the ids can go once they are sorted.
     fn keep(&mut self, id: u64, word: u64) {
         self.ids.push(id);
         self.words.push(word);
@@ -778,24 +779,43 @@ impl Indexer {
         let class_starts = vec![0u32; class_ids.len()];
         let objects = std::mem::replace(&mut self.objects, Column::with_capacity(0));
         let starts = std::mem::replace(&mut self.starts, Column::with_capacity(0));
-        let parts = std::mem::take(&mut self.parts);
+        let mut parts = std::mem::take(&mut self.parts);
         let hashes = std::mem::replace(&mut self.hashes, Column::with_capacity(0));
         let walked = (Records::Paired(&objects), &starts[..], &hashes[..], 0);
         let class_run = (Records::Apart(&class_ids, &class_words), &class_starts[..], &[][..], 0);
-        // HotSpot writes by address in runs: merge the runs, earlier ones first on equal ids, which is
-        // a stable sort. The first record of each id is kept.
+        let read = runs_read(walked, &parts, class_run);
+        // The collectors that walk regions (G1, Parallel, Serial) write by address in runs: merge the runs,
+        // earlier ones first on equal ids, which is a stable sort. The first record of each id is kept. A
+        // collector that walks the graph (ZGC, Shenandoah) writes in no order, and its records are sorted.
+        let total: usize = read.iter().map(|run| run.0.len()).sum();
+        let most_runs = (total / FRAGMENTED_RUN_LEN).max(MIN_FRAGMENTED_RUNS);
         let mut runs: Vec<Run> = Vec::new();
-        for (records, starts, hashes, reference_base) in runs_read(walked, &parts, class_run) {
+        'read: for &(records, starts, hashes, reference_base) in &read {
             let mut start = 0;
             for i in 1..=records.len() {
                 if i == records.len() || records.id(i) < records.id(i - 1) {
                     runs.push((records.range(start, i), &starts[start..i], hashes, reference_base));
                     start = i;
+                    if runs.len() > most_runs {
+                        break 'read;
+                    }
                 }
             }
         }
-        let merged = merge_runs(&runs, self.classes.len(), keep);
-        drop(runs);
+        let merged = if runs.len() > most_runs {
+            drop(runs);
+            let order = Order::new(&read);
+            drop(read);
+            // The order holds every id: the ids the workers read can go before the table is filled.
+            for part in &mut parts {
+                part.ids = Vec::new();
+            }
+            merge_sorted(&order, &runs_read(walked, &parts, class_run), self.classes.len(), keep)
+        } else {
+            let merged = merge_runs(&runs, self.classes.len(), keep);
+            drop((runs, read));
+            merged
+        };
         // Freeing what the walk read takes a while, and nothing waits for it.
         std::thread::spawn(move || drop((parts, objects, starts, hashes)));
         let table = ObjectTable::from_steps(&self.classes, sizing, merged.ids, merged.shapes);
@@ -807,7 +827,7 @@ impl Indexer {
 }
 
 /// Records as the walk kept them: each one's id and word, paired by the sequential walk, apart in a
-/// worker's part.
+/// worker's part. The words give the count: a part's ids go once they are sorted.
 #[derive(Clone, Copy)]
 enum Records<'a> {
     Paired(&'a [[u64; 2]]),
@@ -893,6 +913,253 @@ fn merge_stretches(runs: &[Run]) -> Vec<(usize, usize, usize)> {
     stretches
 }
 
+/// Runs shorter than this on average are not merged: the records are sorted.
+const FRAGMENTED_RUN_LEN: usize = 64;
+/// Up to this many runs are merged whatever their length.
+const MIN_FRAGMENTED_RUNS: usize = 1024;
+/// Sorted keys a worker counts and fills at a time.
+const KEY_UNIT: usize = 1 << 16;
+/// Records a worker buckets at a time.
+const BUCKET_UNIT: usize = 1 << 20;
+/// Key buckets per worker, so an uneven one does not hold the others up.
+const BUCKETS_PER_WORKER: usize = 8;
+/// Ids sampled per bucket to place the bucket bounds.
+const SAMPLES_PER_BUCKET: usize = 256;
+
+/// A sort key: an id's steps above the lowest id over the record's place among all records, so keys
+/// sort by id, the earlier record first. One 8-byte word while both fit, else two, the steps first.
+trait Key: Copy + Ord + Send + Sync {
+    /// 8-byte words in a key.
+    const WORDS: usize;
+    fn pack(step: u64, place: u64, place_bits: u32) -> Self;
+    fn step(self, place_bits: u32) -> u64;
+    fn place(self, place_bits: u32) -> u64;
+    /// Write the key as words `at..at + WORDS`.
+    fn put(self, words: &[AtomicU64], at: usize);
+    /// The words as keys.
+    fn keys(words: &mut [u64]) -> &mut [Self];
+}
+
+impl Key for u64 {
+    const WORDS: usize = 1;
+
+    fn pack(step: u64, place: u64, place_bits: u32) -> u64 {
+        step << place_bits | place
+    }
+
+    fn step(self, place_bits: u32) -> u64 {
+        self >> place_bits
+    }
+
+    fn place(self, place_bits: u32) -> u64 {
+        self & ((1 << place_bits) - 1)
+    }
+
+    fn put(self, words: &[AtomicU64], at: usize) {
+        words[at].store(self, Relaxed);
+    }
+
+    fn keys(words: &mut [u64]) -> &mut [u64] {
+        words
+    }
+}
+
+impl Key for [u64; 2] {
+    const WORDS: usize = 2;
+
+    fn pack(step: u64, place: u64, _: u32) -> [u64; 2] {
+        [step, place]
+    }
+
+    fn step(self, _: u32) -> u64 {
+        self[0]
+    }
+
+    fn place(self, _: u32) -> u64 {
+        self[1]
+    }
+
+    fn put(self, words: &[AtomicU64], at: usize) {
+        words[at].store(self[0], Relaxed);
+        words[at + 1].store(self[1], Relaxed);
+    }
+
+    fn keys(words: &mut [u64]) -> &mut [[u64; 2]] {
+        words.as_chunks_mut().0
+    }
+}
+
+/// Every record's key in id order, one of each id kept (the first), as 8-byte words.
+struct Order {
+    keys: Column<u64>,
+    /// A key is two words.
+    wide: bool,
+    /// The lowest id, and how far an id's distance above it shifts down to its steps.
+    base: u64,
+    shift: u32,
+    place_bits: u32,
+    /// Each run's first place, then the record count.
+    firsts: Vec<u64>,
+}
+
+impl Order {
+    fn new(read: &[Run]) -> Order {
+        let mut firsts = vec![0u64];
+        for run in read {
+            firsts.push(firsts[firsts.len() - 1] + run.0.len() as u64);
+        }
+        let total = firsts[read.len()];
+        // Lowest and highest id, and whether every id is a whole number of 8-byte steps from the first.
+        let first = read.first().map_or(0, |run| run.0.id(0));
+        let spans = parallel::items(read, |run| {
+            (0..run.0.len())
+                .map(|at| run.0.id(at))
+                .fold((u64::MAX, 0, 0), |(min, max, off), id| (min.min(id), max.max(id), off | (id ^ first)))
+        });
+        let (base, max, off) = spans
+            .into_iter()
+            .fold((u64::MAX, 0, 0), |(min, max, off), span| (min.min(span.0), max.max(span.1), off | span.2));
+        let shift = if off.trailing_zeros() >= 3 { 3 } else { 0 };
+        let place_bits = u64::BITS - total.leading_zeros();
+        let step_bits = u64::BITS - ((max - base) >> shift).leading_zeros();
+        let wide = step_bits + place_bits > u64::BITS;
+        let mut order = Order { keys: Column::with_capacity(0), wide, base, shift, place_bits, firsts };
+        order.keys = if wide { order.sorted::<[u64; 2]>(read) } else { order.sorted::<u64>(read) };
+        order
+    }
+
+    /// The keys of `read` sorted, later records of an id dropped. Keys go into buckets by id, bounds drawn
+    /// from a sample, and the workers sort a bucket each.
+    fn sorted<K: Key>(&self, read: &[Run]) -> Column<u64> {
+        let total = self.firsts[read.len()] as usize;
+        let buckets = parallel::threads() * BUCKETS_PER_WORKER;
+        let step = (total / (buckets * SAMPLES_PER_BUCKET)).max(1);
+        let mut sample: Vec<u64> =
+            read.iter().flat_map(|run| (0..run.0.len()).step_by(step).map(|at| run.0.id(at))).collect();
+        sample.sort_unstable();
+        let bounds: Vec<u64> = (1..buckets).map(|bucket| sample[bucket * sample.len() / buckets]).collect();
+        let bucket_of = |id: u64| bounds.partition_point(|&bound| bound <= id);
+        let units: Vec<(usize, usize, usize)> = read
+            .iter()
+            .enumerate()
+            .flat_map(|(run, records)| {
+                let len = records.0.len();
+                (0..len).step_by(BUCKET_UNIT).map(move |lo| (run, lo, (lo + BUCKET_UNIT).min(len)))
+            })
+            .collect();
+        let counts = parallel::items(&units, |&(run, lo, hi)| {
+            let mut counts = vec![0usize; buckets];
+            for at in lo..hi {
+                counts[bucket_of(read[run].0.id(at))] += 1;
+            }
+            counts
+        });
+        // Each unit's first place in each bucket: buckets in order, the units in order inside one.
+        let mut next = 0;
+        let mut ends = Vec::with_capacity(buckets);
+        let mut places = vec![vec![0usize; buckets]; units.len()];
+        for bucket in 0..buckets {
+            for (unit, counts) in counts.iter().enumerate() {
+                places[unit][bucket] = next;
+                next += counts[bucket];
+            }
+            ends.push(next);
+        }
+        let mut column = Column::<u64>::zeroed(total * K::WORDS);
+        {
+            let words = column.atomics();
+            let filling: Vec<_> = units.iter().zip(places).collect();
+            parallel::items(&filling, |&(&(run, lo, hi), ref places)| {
+                let mut places = places.clone();
+                for (place, index) in (self.firsts[run] + lo as u64..).zip(lo..hi) {
+                    let id = read[run].0.id(index);
+                    let at = &mut places[bucket_of(id)];
+                    K::pack((id - self.base) >> self.shift, place, self.place_bits)
+                        .put(words, *at * K::WORDS);
+                    *at += 1;
+                }
+            });
+        }
+        let keys = K::keys(&mut column);
+        {
+            let mut rest = &mut keys[..];
+            let mut sorting = Vec::with_capacity(buckets);
+            let mut start = 0;
+            for end in ends {
+                let (bucket, tail) = std::mem::take(&mut rest).split_at_mut(end - start);
+                (rest, start) = (tail, end);
+                sorting.push(Mutex::new(bucket));
+            }
+            parallel::items(&sorting, |bucket| bucket.lock().expect("worker panicked").sort_unstable());
+        }
+        // Later records of an id go: few, so the keys between them close up in turn.
+        let bits = self.place_bits;
+        let repeats: Vec<usize> = parallel::ranges(keys.len(), |lo, hi| {
+            (lo.max(1)..hi).filter(|&at| keys[at].step(bits) == keys[at - 1].step(bits)).collect::<Vec<_>>()
+        })
+        .concat();
+        let mut kept = repeats.first().copied().unwrap_or(keys.len());
+        for (i, &repeat) in repeats.iter().enumerate() {
+            let next = repeats.get(i + 1).copied().unwrap_or(keys.len());
+            keys.copy_within(repeat + 1..next, kept);
+            kept += next - repeat - 1;
+        }
+        column.truncate(kept * K::WORDS);
+        column.shrink_to_fit();
+        column
+    }
+
+    fn len(&self) -> usize {
+        self.keys.len() / if self.wide { 2 } else { 1 }
+    }
+
+    /// The steps and place of key `at`.
+    fn key(&self, at: usize) -> (u64, u64) {
+        if self.wide {
+            (self.keys[2 * at], self.keys[2 * at + 1])
+        } else {
+            let key = self.keys[at];
+            (Key::step(key, self.place_bits), Key::place(key, self.place_bits))
+        }
+    }
+
+    fn id(&self, at: usize) -> u64 {
+        self.base + (self.key(at).0 << self.shift)
+    }
+
+    /// The table's ids: the keys' steps as they are while they are 8-byte ones within four bytes, which
+    /// is what the lookup takes; else whole.
+    fn ids(&self) -> TableIds {
+        let last_step = self.len().checked_sub(1).map_or(0, |last| self.key(last).0);
+        if self.shift == 3 && u32::try_from(last_step).is_ok() {
+            return TableIds::Steps(self.base, Blocked::new(self.len(), |at| self.key(at).0));
+        }
+        let mut wide = Column::<u64>::zeroed(self.len());
+        parallel::chunks(&mut wide, |start, part| {
+            for (id, at) in part.iter_mut().zip(start..) {
+                *id = self.id(at);
+            }
+        });
+        TableIds::Wide(wide)
+    }
+}
+
+/// The table's columns from records in no order, by their sorted keys; the ids of `read` are not looked at.
+fn merge_sorted(order: &Order, read: &[Run], class_count: usize, keep: bool) -> Merged {
+    let end = |unit: usize| ((unit + 1) * KEY_UNIT).min(order.len());
+    let entries = |unit: usize| {
+        (unit * KEY_UNIT..end(unit)).map(|at| {
+            let (step, place) = order.key(at);
+            let run = order.firsts.partition_point(|&first| first <= place) - 1;
+            let ((records, starts, hashes, reference_base), index) =
+                (read[run], (place - order.firsts[run]) as usize);
+            (order.base + (step << order.shift), records.word(index), starts[index], hashes, reference_base)
+        })
+    };
+    let last = |unit: usize| order.id(end(unit) - 1);
+    merge_table(order.len().div_ceil(KEY_UNIT), entries, last, class_count, keep, Some(order.ids()))
+}
+
 /// The table's columns from runs in id order, merged.
 fn merge_runs(runs: &[Run], class_count: usize, keep: bool) -> Merged {
     let stretches = merge_stretches(runs);
@@ -905,7 +1172,7 @@ fn merge_runs(runs: &[Run], class_count: usize, keep: bool) -> Merged {
         let (run, _, end) = stretches[unit];
         runs[run].0.id(end - 1)
     };
-    merge_table(stretches.len(), entries, last, class_count, keep)
+    merge_table(stretches.len(), entries, last, class_count, keep, None)
 }
 
 /// A record in id order: its id and word, where its references start (or its hash slot), the hashes the
@@ -923,13 +1190,14 @@ struct Merged {
 
 /// The table's columns from `units` stretches of records in id order, `entries(unit)` each and `last(unit)`
 /// its last id, one of each id kept (the first), over the workers: each stretch is counted first, so every
-/// worker knows where its stretches' objects go.
+/// worker knows where its stretches' objects go. `ids`, when given, are the table's ids already.
 fn merge_table<'a, I: Iterator<Item = Entry<'a>>>(
     units: usize,
     entries: impl Fn(usize) -> I + Sync,
     last: impl Fn(usize) -> u64 + Sync,
     class_count: usize,
     keep: bool,
+    ids: Option<TableIds>,
 ) -> Merged {
     let last_id = |k: usize| k.checked_sub(1).map(&last);
     let base = if units == 0 { 0 } else { entries(0).next().map_or(0, |entry| entry.0) };
@@ -954,9 +1222,11 @@ fn merge_table<'a, I: Iterator<Item = Entry<'a>>>(
     .concat();
     let total: usize = counts.iter().map(|count| count.0).sum();
     let total_arrays: usize = counts.iter().map(|count| count.1).sum();
-    let narrow = counts.iter().all(|count| count.2);
+    // Ids not given go in as four-byte steps when they all fit, else whole.
+    let narrow = ids.is_none() && counts.iter().all(|count| count.2);
+    let whole = ids.is_none() && !narrow;
     let mut steps = Column::<u32>::zeroed(if narrow { total } else { 0 });
-    let mut wide = Column::<u64>::zeroed(if narrow { 0 } else { total });
+    let mut wide = Column::<u64>::zeroed(if whole { total } else { 0 });
     let packing = Packing::new(class_count);
     let mut words = Column::<u32>::zeroed(total);
     let mut starts = Column::<u32>::zeroed(if keep { total } else { 0 });
@@ -984,7 +1254,7 @@ fn merge_table<'a, I: Iterator<Item = Entry<'a>>>(
         let arrays: usize = counts[lo..hi].iter().map(|count| count.1).sum();
         let (id_part, rest) = std::mem::take(&mut id_rest).split_at_mut(if narrow { objects } else { 0 });
         id_rest = rest;
-        let (wide_part, rest) = std::mem::take(&mut wide_rest).split_at_mut(if narrow { 0 } else { objects });
+        let (wide_part, rest) = std::mem::take(&mut wide_rest).split_at_mut(if whole { objects } else { 0 });
         wide_rest = rest;
         let (shape_part, rest) = std::mem::take(&mut shape_rest).split_at_mut(objects);
         shape_rest = rest;
@@ -1011,7 +1281,7 @@ fn merge_table<'a, I: Iterator<Item = Entry<'a>>>(
                     let start = start.wrapping_add(reference_base);
                     if narrow {
                         id_part[at] = ((id - base) >> 3) as u32;
-                    } else {
+                    } else if whole {
                         wide_part[at] = id;
                     }
                     // An instance's size comes from its class.
@@ -1035,7 +1305,11 @@ fn merge_table<'a, I: Iterator<Item = Entry<'a>>>(
         instances.iter_mut().zip(part).for_each(|(total, count)| *total += count);
         long.extend(part_long);
     }
-    let ids = if narrow { TableIds::steps(base, &steps) } else { TableIds::Wide(wide) };
+    let ids = match ids {
+        Some(ids) => ids,
+        None if narrow => TableIds::steps(base, &steps),
+        None => TableIds::Wide(wide),
+    };
     Merged { ids, shapes: Shapes::new(words, packing, long), starts, hashes: array_values, instances }
 }
 
