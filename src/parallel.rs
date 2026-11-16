@@ -182,3 +182,26 @@ pub fn bits(len: usize, f: impl Fn(usize) -> bool + Sync) -> Bits {
 pub fn run_all<T: Send>(tasks: Vec<impl FnOnce() -> T + Send>) -> Vec<T> {
     run(tasks.into_iter())
 }
+
+/// Work started beside the caller's own, on another thread when there is more than one worker.
+pub enum Aside<'scope, T> {
+    Started(thread::ScopedJoinHandle<'scope, T>),
+    Waiting(Box<dyn FnOnce() -> T + 'scope>),
+}
+
+/// Start `f` beside the caller; with one worker it runs when its result is taken.
+pub fn aside<'scope, T: Send + 'scope>(
+    scope: &'scope thread::Scope<'scope, '_>,
+    f: impl FnOnce() -> T + Send + 'scope,
+) -> Aside<'scope, T> {
+    if threads() > 1 { Aside::Started(scope.spawn(f)) } else { Aside::Waiting(Box::new(f)) }
+}
+
+impl<T> Aside<'_, T> {
+    pub fn take(self) -> T {
+        match self {
+            Aside::Started(handle) => handle.join().expect("worker panicked"),
+            Aside::Waiting(f) => f(),
+        }
+    }
+}
