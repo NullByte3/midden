@@ -157,7 +157,7 @@ fn leaf_runs_cross_worker_boundaries() {
     assert_eq!(tree.retained(0), u64::from(count - 1) * 16);
     assert_eq!(tree.subtree(0).len(), count as usize - 1);
     assert_eq!(tree.idom[count as usize - 1], NONE);
-    assert!(tree.subtree(count - 1).is_empty());
+    assert_eq!(tree.subtree(count - 1), &[] as &[u32]);
     for object in 1..count - 1 {
         assert_eq!(tree.idom[object as usize], 0);
         assert_eq!(tree.retained(object), 16);
