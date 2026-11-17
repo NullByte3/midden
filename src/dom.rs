@@ -8,6 +8,9 @@ use super::graph::Graph;
 use super::parallel;
 use super::store::{Bits, Column};
 
+#[cfg(test)]
+mod tests;
+
 /// Parent and dominator chains are cut at this length, so a corrupt tree cannot loop.
 const MAX_CHAIN_LEN: usize = 50_000_000;
 
@@ -37,17 +40,12 @@ fn reach_blocking(graph: &Graph, dump: &Dump, blocked: &[(u32, u32)]) -> Reachab
     // Parents plus one, so zeroed pages read back `NONE` for the unreached.
     let mut parent_column = Column::<u32>::zeroed(object_count);
     let mut seen_bits = Bits::new(object_count);
-    let (parent, seen) = (parent_column.atomics(), seen_bits.atomics());
-    let visit = |object: u32| {
-        let bit = 1u64 << (object % 64);
-        seen[object as usize / 64].fetch_or(bit, Relaxed) & bit == 0
-    };
-    let is_seen = |object: u32| seen[object as usize / 64].load(Relaxed) >> (object % 64) & 1 != 0;
     let allowed = |from: u32, to: u32| blocked.is_empty() || !blocked.contains(&(from, to));
     let mut order = Column::<u32>::with_capacity(object_count);
     for &root in &graph.roots {
-        if visit(root) {
-            parent[root as usize].store(graph.root + 1, Relaxed);
+        if !seen_bits.get(root as usize) {
+            seen_bits.set(root as usize);
+            parent_column[root as usize] = graph.root + 1;
             order.push(root);
         }
     }
@@ -60,13 +58,20 @@ fn reach_blocking(graph: &Graph, dump: &Dump, blocked: &[(u32, u32)]) -> Reachab
             for pos in lo..hi {
                 let from = order[pos];
                 for target in graph.edges(from).targets() {
-                    if !is_seen(target) && allowed(from, target) && visit(target) {
-                        parent[target as usize].store(from + 1, Relaxed);
+                    if !seen_bits.get(target as usize) && allowed(from, target) {
+                        seen_bits.set(target as usize);
+                        parent_column[target as usize] = from + 1;
                         order.push(target);
                     }
                 }
             }
         } else {
+            let (parent, seen) = (parent_column.atomics(), seen_bits.atomics());
+            let is_seen = |object: u32| seen[object as usize / 64].load(Relaxed) >> (object % 64) & 1 != 0;
+            let visit = |object: u32| {
+                let bit = 1u64 << (object % 64);
+                seen[object as usize / 64].fetch_or(bit, Relaxed) & bit == 0
+            };
             let claim = claim_column.get_or_insert_with(|| Column::zeroed(object_count)).atomics();
             let frontier = &order[lo..hi];
             let found = parallel::ranges(frontier.len(), |start, end| {
@@ -298,7 +303,13 @@ impl DominatorTree {
 
     /// Children, biggest retained first. Sorted on demand: the report opens a few hundred of millions.
     pub fn children(&self, object: u32) -> Vec<u32> {
-        let mut children: Vec<u32> = self.preorder_children(object).collect();
+        self.children_matching(object, |_| true)
+    }
+
+    /// Visit every child, sorting only those accepted by `take`. Reports can count hidden children
+    /// without allocating and sorting a list of millions of objects they will never display.
+    pub fn children_matching(&self, object: u32, mut take: impl FnMut(u32) -> bool) -> Vec<u32> {
+        let mut children: Vec<u32> = self.preorder_children(object).filter(|&child| take(child)).collect();
         children.sort_unstable_by(|&a, &b| self.bigger(a, b));
         children
     }
@@ -426,7 +437,13 @@ pub fn dominators(graph: &Graph, dump: &Dump) -> DominatorTree {
             stack.pop();
             continue;
         }
-        frame.1 += 1;
+        // Once this edge is taken, an exhausted frame has no work to resume. Drop it before
+        // descending so a linked list needs constant stack space rather than one frame per object.
+        if next + 1 == end {
+            stack.pop();
+        } else {
+            frame.1 += 1;
+        }
         let successor = if number == 0 { graph.roots[next] } else { targets[next] };
         if unvisited.take(successor as usize) {
             let successor_number = vertex.len() as u32;
@@ -587,11 +604,24 @@ pub fn dominators(graph: &Graph, dump: &Dump) -> DominatorTree {
     {
         let (bytes, counts) = (subtree_bytes.atomics(), size.atomics());
         parallel::ranges(object_count, |lo, hi| {
+            // Adjacent leaves often belong to the same array. Combine their contributions before
+            // touching its shared counters, which otherwise serialize all workers on that array.
+            let (mut owner, mut total, mut count) = (0, 0u64, 0u32);
             for (object, (&leaf, &number)) in (lo..hi).zip(idom[lo..hi].iter().zip(&dfs_number[lo..hi])) {
                 if number == LEAF && leaf != 0 {
-                    bytes[leaf as usize - 1].fetch_add(u64::from(dump.objects.shallow(object)), Relaxed);
-                    counts[leaf as usize - 1].fetch_add(1, Relaxed);
+                    if leaf != owner && count != 0 {
+                        bytes[owner as usize - 1].fetch_add(total, Relaxed);
+                        counts[owner as usize - 1].fetch_add(count, Relaxed);
+                        (total, count) = (0, 0);
+                    }
+                    owner = leaf;
+                    total += u64::from(dump.objects.shallow(object));
+                    count += 1;
                 }
+            }
+            if count != 0 {
+                bytes[owner as usize - 1].fetch_add(total, Relaxed);
+                counts[owner as usize - 1].fetch_add(count, Relaxed);
             }
         });
     }
@@ -663,17 +693,33 @@ pub fn dominators(graph: &Graph, dump: &Dump) -> DominatorTree {
         let (preorder, subtree_end) = (preorder.atomics(), subtree_end.atomics());
         let (free, numbers) = (free.atomics(), dfs_number.atomics());
         parallel::ranges(object_count, |lo, hi| {
-            for object in lo..hi {
+            let mut object = lo;
+            while object < hi {
                 if numbers[object].load(Relaxed) != LEAF {
+                    object += 1;
                     continue;
                 }
-                match idom[object] {
-                    NONE => numbers[object].store(NONE, Relaxed),
+                let dominator = idom[object];
+                let start = object;
+                object += 1;
+                while object < hi && idom[object] == dominator && numbers[object].load(Relaxed) == LEAF {
+                    object += 1;
+                }
+                match dominator {
+                    NONE => {
+                        for number in &numbers[start..object] {
+                            number.store(NONE, Relaxed);
+                        }
+                    }
                     dominator => {
-                        let at =
-                            free[numbers[dominator as usize].load(Relaxed) as usize].fetch_add(1, Relaxed);
-                        preorder[at as usize].store(object as u32, Relaxed);
-                        subtree_end[at as usize].store(at + 1, Relaxed);
+                        // Reserve a whole run with one atomic operation; every worker then writes
+                        // its leaves to a disjoint, contiguous slice of the preorder.
+                        let first = free[numbers[dominator as usize].load(Relaxed) as usize]
+                            .fetch_add((object - start) as u32, Relaxed);
+                        for (object, at) in (start..object).zip(first..) {
+                            preorder[at as usize].store(object as u32, Relaxed);
+                            subtree_end[at as usize].store(at + 1, Relaxed);
+                        }
                     }
                 }
             }

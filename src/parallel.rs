@@ -62,10 +62,13 @@ pub fn items<I: Sync, T: Send>(items: &[I], f: impl Fn(&I) -> T + Sync) -> Vec<T
     out.into_iter().map(|(_, result)| result).collect()
 }
 
-/// Run each task on its own scoped thread; results in task order.
-fn run<'env, T: Send + 'env>(tasks: impl Iterator<Item = impl FnOnce() -> T + Send + 'env>) -> Vec<T> {
+/// Run each task on a scoped worker, or on the caller for a single task; results in task order.
+fn run<'env, T: Send + 'env>(mut tasks: impl Iterator<Item = impl FnOnce() -> T + Send + 'env>) -> Vec<T> {
+    let Some(first) = tasks.next() else { return Vec::new() };
+    let Some(second) = tasks.next() else { return vec![first()] };
     thread::scope(|scope| {
-        let handles: Vec<_> = tasks.map(|task| scope.spawn(task)).collect();
+        let handles: Vec<_> =
+            [first, second].into_iter().chain(tasks).map(|task| scope.spawn(task)).collect();
         handles.into_iter().map(|handle| handle.join().expect("worker panicked")).collect()
     })
 }
@@ -178,4 +181,27 @@ pub fn bits(len: usize, f: impl Fn(usize) -> bool + Sync) -> Bits {
 /// Run each task on its own worker; results in task order.
 pub fn run_all<T: Send>(tasks: Vec<impl FnOnce() -> T + Send>) -> Vec<T> {
     run(tasks.into_iter())
+}
+
+/// Work started beside the caller's own, on another thread when there is more than one worker.
+pub enum Aside<'scope, T> {
+    Started(thread::ScopedJoinHandle<'scope, T>),
+    Waiting(Box<dyn FnOnce() -> T + 'scope>),
+}
+
+/// Start `f` beside the caller; with one worker it runs when its result is taken.
+pub fn aside<'scope, T: Send + 'scope>(
+    scope: &'scope thread::Scope<'scope, '_>,
+    f: impl FnOnce() -> T + Send + 'scope,
+) -> Aside<'scope, T> {
+    if threads() > 1 { Aside::Started(scope.spawn(f)) } else { Aside::Waiting(Box::new(f)) }
+}
+
+impl<T> Aside<'_, T> {
+    pub fn take(self) -> T {
+        match self {
+            Aside::Started(handle) => handle.join().expect("worker panicked"),
+            Aside::Waiting(f) => f(),
+        }
+    }
 }

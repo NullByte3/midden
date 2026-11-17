@@ -32,6 +32,7 @@ use super::detail::Fetched;
 use super::dump::{Kind, NONE};
 use super::graph::{ARRAY_ELEMENT, LOADER};
 use super::options::{Section, Sections, Sort};
+use super::parallel;
 use super::pattern::{Pattern, short};
 use super::strings;
 use crate::cli::Args;
@@ -190,8 +191,32 @@ impl<'a> Plan<'a> {
     }
 
     fn plan_sections(&mut self) {
+        std::thread::scope(|scope| self.plan_sections_in(scope));
+    }
+
+    /// The sections in report order. Those that scan the whole heap on their own start on other threads
+    /// first, and are taken when their turn comes.
+    fn plan_sections_in<'scope>(&mut self, scope: &'scope std::thread::Scope<'scope, '_>)
+    where
+        'a: 'scope,
+    {
         let (heap, view) = (self.heap, self.view);
         let shows = |section: Section| view.sections.has(section);
+        let collections =
+            shows(Section::Collections).then(|| parallel::aside(scope, move || heap.collections()));
+        let loaders = shows(Section::Loaders).then(|| {
+            let histogram = self.histogram.clone();
+            parallel::aside(scope, move || {
+                let loaders = heap.loaders(&histogram);
+                let stale = heap.stale_loaders(&loaders);
+                let objects: Vec<u32> = stale.iter().map(|stale| stale.object).collect();
+                let referrers = heap.referrers(|object| objects.iter().position(|&loader| loader == object));
+                (loaders, stale, referrers)
+            })
+        });
+        let references = shows(Section::References)
+            .then(|| parallel::aside(scope, move || (heap.references(), heap.finalizers(), heap.cleaners())));
+        let garbage = shows(Section::Garbage).then(|| parallel::aside(scope, move || heap.garbage()));
         if shows(Section::Suspects) {
             self.plan_suspects();
         }
@@ -206,8 +231,8 @@ impl<'a> Plan<'a> {
         if shows(Section::Classes) && view.by_package {
             self.packages = heap.packages(&self.histogram);
         }
-        if shows(Section::Collections) {
-            let collections = heap.collections();
+        if let Some(collections) = collections {
+            let collections = collections.take();
             self.shown.extend(collections.sparse.iter().take(view.top).map(|sparse| sparse.object));
             self.shown.extend(collections.colliding.iter().take(view.top).map(|&(object, _)| object));
             self.collections = Some(collections);
@@ -223,19 +248,17 @@ impl<'a> Plan<'a> {
             self.shown.extend(locals.values.iter().take(view.top).map(|local| local.value));
             self.locals = Some(locals);
         }
-        if shows(Section::Loaders) {
-            self.plan_loaders();
+        if let Some(loaders) = loaders {
+            self.plan_loaders(loaders.take());
         }
         if let Some(duplicates) = self.inputs.duplicates.as_ref().filter(|_| shows(Section::Strings)) {
             self.shown.extend(duplicates.groups.iter().take(view.top).map(|group| group.string));
         }
-        if shows(Section::References) {
-            self.references = heap.references();
-            self.finalizers = heap.finalizers();
-            self.cleaners = heap.cleaners();
+        if let Some(references) = references {
+            (self.references, self.finalizers, self.cleaners) = references.take();
         }
-        if shows(Section::Garbage) {
-            self.garbage = heap.garbage();
+        if let Some(garbage) = garbage {
+            self.garbage = garbage.take();
         }
         if shows(Section::System) {
             self.system_properties = heap.system_properties();
@@ -269,10 +292,12 @@ impl<'a> Plan<'a> {
         }
     }
 
-    fn plan_loaders(&mut self) {
+    fn plan_loaders(
+        &mut self,
+        (loaders, stale, referrers): (Vec<LoaderRow>, Vec<Stale>, Vec<Vec<Referrer>>),
+    ) {
         let heap = self.heap;
-        self.loaders = heap.loaders(&self.histogram);
-        self.stale = heap.stale_loaders(&self.loaders);
+        (self.loaders, self.stale, self.stale_referrers) = (loaders, stale, referrers);
         for loader in self
             .loaders
             .iter()
@@ -283,7 +308,6 @@ impl<'a> Plan<'a> {
             self.shown.extend(heap.loader_name(loader));
         }
         let stale: Vec<u32> = self.stale.iter().map(|stale| stale.object).collect();
-        self.stale_referrers = heap.referrers(|object| stale.iter().position(|&loader| loader == object));
         for object in stale {
             self.show_paths(object);
         }
@@ -337,12 +361,16 @@ impl<'a> Plan<'a> {
         self.shown.push(object);
         rows.push(TreeRow { depth, object, label, hidden: None });
         let mut hidden = (0u64, 0u64);
-        for child in heap.dominators.children(object) {
+        let children = heap.dominators.children_matching(object, |child| {
             if depth + 1 >= self.view.depth || heap.retained(child) < floor.max(1) {
                 hidden.0 += 1;
                 hidden.1 += heap.retained(child);
-                continue;
+                false
+            } else {
+                true
             }
+        });
+        for child in children {
             let label = heap.graph.label_of(object, child);
             self.tree(child, label, depth + 1, floor, rows);
         }
